@@ -1,3 +1,5 @@
 build/
 .cache
 source/vendor/limine
+compile_commands.json
+source/kernel/common.hpp

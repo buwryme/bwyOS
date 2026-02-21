@@ -5,3 +5,6 @@ CompileFlags:
     - -ffreestanding
     - -fno-exceptions
     - -fno-rtti
+
+Diagnostics:
+  UnusedIncludes: None

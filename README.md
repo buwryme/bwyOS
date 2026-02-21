@@ -17,9 +17,10 @@ a minimal, freestanding kernel for x86_64.
 requires a cross-compiler (e.g., this repo uses `clang++`) and `make`.
 
 ```bash
-make
+make -j(nproc)
 ```
 
+(NOTE: you have to add `-j(nproc)`)
 this will produce `build/bwyOS.iso`.
 
 before building, ensure that you've gotten the limine vendor files,
