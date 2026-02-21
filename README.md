@@ -22,6 +22,15 @@ make
 
 this will produce `build/bwyOS.iso`.
 
+before building, ensure that you've gotten the limine vendor files,
+which you can do by running:
+
+```bash
+make deploy-limine-vendor
+```
+
+this project has no affiliation with limine. you agree to abide by the limine licensing by running that command.
+
 ## running
 
 ```bash
