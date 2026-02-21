@@ -112,3 +112,24 @@ deploy-limine-vendor:
 	@mkdir -p source/vendor
 	$(call run_cmd,cloning limine vendor,git clone https://github.com/limine-bootloader/limine.git --branch=v10.x-binary --depth=1 source/vendor/limine)
 	$(call run_cmd,downloading limine.h,curl -fsSL https://raw.githubusercontent.com/limine-bootloader/limine-protocol/trunk/include/limine.h -o source/vendor/limine/limine.h)
+
+
+count_lines:
+	@declare -A counts; \
+	for ext in ld eixx conf; do \
+		total=0; \
+		for f in $$(find . -type f -name "*.$$ext"); do \
+			lines=$$(wc -l < "$$f"); \
+			total=$$((total + lines)); \
+		done; \
+		counts["$$ext"]=$$total; \
+	done; \
+	grand_total=0; \
+	printf "%-10s %s\n" "extension" "lines"; \
+	printf "%-10s %s\n" "---------" "-----"; \
+	for ext in ld eixx conf; do \
+		printf "%-10s %d\n" "$$ext" "$${counts[$$ext]}"; \
+		grand_total=$$((grand_total + $${counts[$$ext]})); \
+	done; \
+	printf "%-10s %s\n" "---------" "-----"; \
+	printf "%-10s %d\n" "total" "$$grand_total"
