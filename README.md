@@ -1,6 +1,6 @@
-# simple x86_64 kernel
+# bwy.kernel
 
-a minimal, freestanding kernel for x86_64 architecture.
+a minimal, freestanding kernel for x86_64.
 
 ## features
 
