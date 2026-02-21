@@ -1,0 +1,173 @@
+#pragma once
+#include <stdint.h>
+#include "../gfx/fb.eixx"
+#include "../gfx/kprint.eixx"
+
+namespace panic {
+
+// ── panic screen ──────────────────────────────────────────────────────────
+//
+// layout:
+//   [solid red header bar]
+//   !! kernel panic !!
+//   reason: <msg>
+//   exception: <name>  vector: <n>
+//   error code: <ec>
+//   [register dump if we have them]
+//   system halted. please reboot.
+//
+// overdraws the whole screen so it's unmistakable.
+
+// cpu register snapshot — pushed by our naked stubs before calling handler
+struct regs_t {
+    uint64_t rax, rbx, rcx, rdx;
+    uint64_t rsi, rdi, rbp, rsp;
+    uint64_t r8,  r9,  r10, r11;
+    uint64_t r12, r13, r14, r15;
+    uint64_t vec; // exception vector
+    uint64_t err; // error code (0 if none)
+    uint64_t rip; // from iret frame
+    uint64_t cs;
+    uint64_t rflags;
+};
+
+static const char* exception_name(uint64_t vec) {
+    switch (vec) {
+        case  0: return "division by zero (#de)";
+        case  1: return "debug (#db)";
+        case  2: return "non-maskable interrupt";
+        case  3: return "breakpoint (#bp)";
+        case  4: return "overflow (#of)";
+        case  5: return "bound range exceeded (#br)";
+        case  6: return "invalid opcode (#ud)";
+        case  7: return "device not available (#nm)";
+        case  8: return "double fault (#df)";
+        case 10: return "invalid tss (#ts)";
+        case 11: return "segment not present (#np)";
+        case 12: return "stack-segment fault (#ss)";
+        case 13: return "general protection fault (#gp)";
+        case 14: return "page fault (#pf)";
+        case 16: return "x87 floating-point (#mf)";
+        case 17: return "alignment check (#ac)";
+        case 18: return "machine check (#mc)";
+        case 19: return "simd floating-point (#xm)";
+        case 21: return "control protection (#cp)";
+        default: return "unknown exception";
+    }
+}
+
+// draw a solid color bar across the full width
+static void draw_bar(uint64_t y, uint64_t h, uint32_t color) {
+    for (uint64_t row = y; row < y + h && row < fb::height; ++row) {
+        uint32_t* line = reinterpret_cast<uint32_t*>(
+            reinterpret_cast<uint8_t*>(fb::pixels) + row * fb::pitch);
+        for (uint64_t x = 0; x < fb::width; ++x)
+            line[x] = color;
+    }
+}
+
+static constexpr uint32_t PANIC_RED    = 0xb71c1c;
+static constexpr uint32_t PANIC_DARK   = 0x1a0000;
+static constexpr uint32_t PANIC_WHITE  = 0xffffff;
+static constexpr uint32_t PANIC_AMBER  = 0xffb300;
+static constexpr uint32_t PANIC_GRAY   = 0x9e9e9e;
+
+[[noreturn]] static void show(const char* msg,
+                               uint64_t vec = ~0ull,
+                               regs_t*  regs = nullptr) {
+    // -- paint background --
+    draw_bar(0, fb::height, PANIC_DARK);
+
+    // -- red header bar --
+    draw_bar(0, 28, PANIC_RED);
+
+    // reset cursor to top
+    fb::cur_x = 4; fb::cur_y = 8;
+
+    // header text (white on red, already drawn)
+    fb::print("  !! kernel panic !!  ", PANIC_WHITE);
+
+    // move below header
+    fb::cur_x = 8; fb::cur_y = 40;
+
+    // reason
+    fb::print("reason   : ", PANIC_GRAY);
+    fb::print(msg, PANIC_WHITE);
+    fb::print("\n", PANIC_WHITE);
+    fb::cur_x = 8;
+
+    // exception info
+    if (vec != ~0ull) {
+        fb::print("exception: ", PANIC_GRAY);
+        fb::print(exception_name(vec), PANIC_AMBER);
+        fb::print("  vector: ", PANIC_GRAY);
+        kprint::u64(vec, PANIC_AMBER);
+        fb::print("\n", PANIC_WHITE);
+        fb::cur_x = 8;
+
+        if (regs) {
+            fb::print("error code: ", PANIC_GRAY);
+            kprint::hex(regs->err, 8, PANIC_AMBER);
+            fb::print("    rip: ", PANIC_GRAY);
+            kprint::hex(regs->rip, 16, PANIC_AMBER);
+            fb::print("\n", PANIC_WHITE);
+            fb::cur_x = 8;
+
+            // register dump — two columns
+            fb::print("\n", PANIC_WHITE); fb::cur_x = 8;
+            fb::print("── registers ────────────────────────────────────────\n", PANIC_GRAY);
+            fb::cur_x = 8;
+
+            auto reg = [](const char* name, uint64_t val) {
+                fb::print(name, PANIC_GRAY);
+                fb::print(": ", PANIC_GRAY);
+                kprint::hex(val, 16, PANIC_WHITE);
+                fb::print("  ", PANIC_WHITE);
+            };
+
+            reg("rax", regs->rax); reg("rbx", regs->rbx);
+            fb::print("\n", PANIC_WHITE); fb::cur_x = 8;
+            reg("rcx", regs->rcx); reg("rdx", regs->rdx);
+            fb::print("\n", PANIC_WHITE); fb::cur_x = 8;
+            reg("rsi", regs->rsi); reg("rdi", regs->rdi);
+            fb::print("\n", PANIC_WHITE); fb::cur_x = 8;
+            reg("rbp", regs->rbp); reg("rsp", regs->rsp);
+            fb::print("\n", PANIC_WHITE); fb::cur_x = 8;
+            reg("r8 ", regs->r8 ); reg("r9 ", regs->r9 );
+            fb::print("\n", PANIC_WHITE); fb::cur_x = 8;
+            reg("r10", regs->r10); reg("r11", regs->r11);
+            fb::print("\n", PANIC_WHITE); fb::cur_x = 8;
+            reg("r12", regs->r12); reg("r13", regs->r13);
+            fb::print("\n", PANIC_WHITE); fb::cur_x = 8;
+            reg("r14", regs->r14); reg("r15", regs->r15);
+            fb::print("\n", PANIC_WHITE); fb::cur_x = 8;
+            fb::print("rflags: ", PANIC_GRAY);
+            kprint::hex(regs->rflags, 16, PANIC_WHITE);
+            fb::print("\n", PANIC_WHITE); fb::cur_x = 8;
+        }
+    }
+
+    // -- red footer bar --
+    uint64_t footer_y = fb::height > 24 ? fb::height - 24 : 0;
+    draw_bar(footer_y, 24, PANIC_RED);
+
+    // footer text
+    fb::cur_x = 8; fb::cur_y = footer_y + 8;
+    fb::print("system halted. please reboot.", PANIC_WHITE);
+
+    // halt forever
+    asm volatile("cli");
+    for (;;) asm volatile("hlt");
+}
+
+// convenience: panic with just a message (no exception context)
+[[noreturn]] inline void kpanic(const char* msg) {
+    show(msg);
+}
+
+// called from exception stubs (below)
+[[noreturn]] inline void kpanic_exception(const char* msg, uint64_t vec, regs_t* regs) {
+    show(msg, vec, regs);
+}
+
+} // namespace panic

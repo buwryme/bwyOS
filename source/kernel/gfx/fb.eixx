@@ -1,0 +1,115 @@
+#pragma once
+#include <stdint.h>
+#include "font.eixx"
+
+namespace fb {
+
+// initialized by fb::init() — plain globals, no constructors
+static uint32_t* pixels = nullptr;
+static uint64_t  pitch  = 0;
+static uint64_t  width  = 0;
+static uint64_t  height = 0;
+static uint64_t  cur_x  = 0;
+static uint64_t  cur_y  = 0;
+
+// tokyo night
+static constexpr uint32_t BG     = 0x121212; // surface
+static constexpr uint32_t FG     = 0xe6e1e5; // on-surface
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-variable"
+// ... ides dont properly detect .eixx files as headers, so..
+// resorting to silencing warnings
+static constexpr uint32_t PROMPT = 0x8ab4f8; // primary (md3 dark blue)
+static constexpr uint32_t GREEN  = 0x81c995; // secondary green tone
+static constexpr uint32_t YELLOW = 0xfdd663; // tertiary amber
+static constexpr uint32_t RED    = 0xf28b82; // error
+static constexpr uint32_t PURPLE = 0xd0bcff; // md3 purple accent
+static constexpr uint32_t GRAY   = 0x9aa0a6; // neutral variant
+
+inline void init(uint32_t* addr, uint64_t w, uint64_t h, uint64_t p) {
+    pixels = addr; width = w; height = h; pitch = p;
+    cur_x = 0; cur_y = 0;
+}
+
+inline void put_pixel(uint64_t x, uint64_t y, uint32_t color) {
+    *((uint32_t*)((uint8_t*)pixels + y * pitch) + x) = color;
+}
+
+inline void draw_char(uint64_t x0, uint64_t y0, char c, uint32_t color) {
+    font::glyph_t g = font::get_glyph(c);
+    for (uint64_t y = 0; y < 8; ++y) {
+        uint8_t row = g.rows[y];
+        for (uint64_t x = 0; x < 8; ++x)
+            if (row & (0x80u >> x))
+                put_pixel(x0+x, y0+y, color);
+    }
+}
+
+inline void clear(uint32_t color = BG) {
+    for (uint64_t y = 0; y < height; ++y) {
+        uint32_t* row = (uint32_t*)((uint8_t*)pixels + y * pitch);
+        for (uint64_t x = 0; x < width; ++x)
+            row[x] = color;
+    }
+}
+
+inline void scroll() {
+    // move everything up by 12px (one line)
+    uint64_t line = 12;
+    for (uint64_t y = 0; y < height - line; ++y) {
+        uint32_t* dst = (uint32_t*)((uint8_t*)pixels + y * pitch);
+        uint32_t* src = (uint32_t*)((uint8_t*)pixels + (y + line) * pitch);
+        for (uint64_t x = 0; x < width; ++x)
+            dst[x] = src[x];
+    }
+    // clear bottom line
+    for (uint64_t y = height - line; y < height; ++y) {
+        uint32_t* row = (uint32_t*)((uint8_t*)pixels + y * pitch);
+        for (uint64_t x = 0; x < width; ++x)
+            row[x] = BG;
+    }
+}
+
+inline void newline() {
+    cur_x = 0;
+    cur_y += 12;
+    if (cur_y + 12 > height) {
+        scroll();
+        cur_y -= 12;
+    }
+}
+
+inline void print(const char* str, uint32_t color = FG) {
+    while (*str) {
+        if (*str == '\n') {
+            newline();
+        } else {
+            draw_char(cur_x, cur_y, *str, color);
+            cur_x += 8;
+            if (cur_x + 8 > width)
+                newline();
+        }
+        ++str;
+    }
+}
+
+inline void erase_cell(uint64_t x, uint64_t y) {
+    for (uint64_t row = 0; row < 12; ++row)
+        for (uint64_t col = 0; col < 8; ++col)
+            put_pixel(x + col, y + row, BG);
+}
+
+inline void backspace() {
+    if (cur_x >= 8) {
+        cur_x -= 8;
+    } else if (cur_y >= 12) {
+        cur_y -= 12;
+        cur_x = (width / 8) * 8 - 8;
+    } else {
+        return;
+    }
+    erase_cell(cur_x, cur_y);
+}
+
+} // namespace fb

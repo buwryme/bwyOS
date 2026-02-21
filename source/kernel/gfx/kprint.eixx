@@ -1,0 +1,59 @@
+#pragma once
+#include <stdint.h>
+#include <stddef.h>
+#include "fb.eixx"
+
+// tiny formatting helpers — no sprintf, no stdlib
+namespace kprint {
+
+// write a null-terminated string
+inline void str(const char* s, uint32_t color = fb::FG) {
+    fb::print(s, color);
+}
+
+// write a single char
+inline void ch(char c, uint32_t color = fb::FG) {
+    char buf[2] = { c, '\0' };
+    fb::print(buf, color);
+}
+
+// unsigned decimal
+inline void u64(uint64_t v, uint32_t color = fb::FG) {
+    if (v == 0) { fb::print("0", color); return; }
+    char buf[21]; int i = 20; buf[20] = '\0';
+    while (v && i > 0) { buf[--i] = '0' + (v % 10); v /= 10; }
+    fb::print(buf + i, color);
+}
+
+// signed decimal
+inline void i64(int64_t v, uint32_t color = fb::FG) {
+    if (v < 0) { fb::print("-", color); u64(static_cast<uint64_t>(-v), color); }
+    else u64(static_cast<uint64_t>(v), color);
+}
+
+// hex with 0x prefix, leading-zero padded to `width` nibbles (0 = minimal)
+inline void hex(uint64_t v, int width = 0, uint32_t color = fb::PURPLE) {
+    fb::print("0x", color);
+    char buf[17]; int i = 16; buf[16] = '\0';
+    do { buf[--i] = "0123456789abcdef"[v & 0xf]; v >>= 4; } while (v);
+    while ((16 - i) < width) buf[--i] = '0';
+    fb::print(buf + i, color);
+}
+
+// bytes formatted as KiB / MiB / GiB
+inline void bytes(uint64_t b, uint32_t color = fb::GREEN) {
+    if (b >= 1024*1024*1024ull) {
+        u64(b / (1024*1024*1024ull), color); fb::print(" gib", color);
+    } else if (b >= 1024*1024ull) {
+        u64(b / (1024*1024ull), color); fb::print(" mib", color);
+    } else if (b >= 1024ull) {
+        u64(b / 1024ull, color); fb::print(" kib", color);
+    } else {
+        u64(b, color); fb::print(" b", color);
+    }
+}
+
+// newline
+inline void nl() { fb::print("\n"); }
+
+} // namespace kprint

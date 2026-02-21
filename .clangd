@@ -1,0 +1,7 @@
+CompileFlags:
+  Add:
+    - -std=c++20
+    - -xc++
+    - -ffreestanding
+    - -fno-exceptions
+    - -fno-rtti

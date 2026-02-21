@@ -1,0 +1,45 @@
+#pragma once
+#include <stdint.h>
+
+namespace pic {
+
+static constexpr uint16_t PIC1_CMD  = 0x20;
+static constexpr uint16_t PIC1_DATA = 0x21;
+static constexpr uint16_t PIC2_CMD  = 0xa0;
+static constexpr uint16_t PIC2_DATA = 0xa1;
+
+static inline void outb(uint16_t port, uint8_t val) {
+    asm volatile("outb %0,%1" :: "a"(val),"Nd"(port));
+}
+static inline void io_wait() { outb(0x80, 0); }
+
+// remap PIC so IRQ0-15 map to vectors 0x20-0x2f
+// (avoids collision with cpu exception vectors 0-31)
+inline void init() {
+    // save masks
+    uint8_t m1, m2;
+    asm volatile("inb %1,%0" : "=a"(m1) : "Nd"(PIC1_DATA));
+    asm volatile("inb %1,%0" : "=a"(m2) : "Nd"(PIC2_DATA));
+
+    // init sequence
+    outb(PIC1_CMD,  0x11); io_wait();
+    outb(PIC2_CMD,  0x11); io_wait();
+    outb(PIC1_DATA, 0x20); io_wait(); // IRQ0 -> int 0x20
+    outb(PIC2_DATA, 0x28); io_wait(); // IRQ8 -> int 0x28
+    outb(PIC1_DATA, 0x04); io_wait(); // cascade on IRQ2
+    outb(PIC2_DATA, 0x02); io_wait();
+    outb(PIC1_DATA, 0x01); io_wait(); // 8086 mode
+    outb(PIC2_DATA, 0x01); io_wait();
+
+    // restore masks
+    outb(PIC1_DATA, m1);
+    outb(PIC2_DATA, m2);
+}
+
+// mask all IRQs — we don't handle them yet, just want cpu stable
+inline void mask_all() {
+    outb(PIC1_DATA, 0xff);
+    outb(PIC2_DATA, 0xff);
+}
+
+} // namespace pic

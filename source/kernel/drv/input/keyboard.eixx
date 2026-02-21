@@ -1,0 +1,105 @@
+#pragma once
+#include <stdint.h>
+#include "../driver.eixx"
+
+// ── drv::keyboard — ps/2 keyboard driver ─────────────────────────────────
+//
+// inherits driver_t, uses validated io:: calls throughout.
+// probe()  checks the ps/2 status port is readable and controller present.
+// start()  flushes the output buffer, enables the keyboard.
+// get_key() blocks until a valid keypress, handling errors from port reads.
+
+namespace drv {
+
+struct keyboard_t : driver_t {
+
+    static constexpr uint16_t PORT_DATA   = 0x60;
+    static constexpr uint16_t PORT_STATUS = 0x64;
+
+    // scancode set 1
+    static constexpr char keymap[128] = {
+        0,  27, '1','2','3','4','5','6','7','8','9','0','-','=','\b',
+        '\t','q','w','e','r','t','y','u','i','o','p','[',']','\n',
+        0,'a','s','d','f','g','h','j','k','l',';','\'','`',
+        0,'\\','z','x','c','v','b','n','m',',','.','/',0,'*',0,' ',
+    };
+
+    static constexpr char shifted[128] = {
+        0,  27, '!','@','#','$','%','^','&','*','(',')','_','+','\b',
+        '\t','Q','W','E','R','T','Y','U','I','O','P','{','}','\n',
+        0,'A','S','D','F','G','H','J','K','L',':','"','~',
+        0,'|','Z','X','C','V','B','N','M','<','>','?',0,'*',0,' ',
+    };
+
+    bool shift = false;
+    bool caps  = false;
+
+    keyboard_t() { init_base("ps2-keyboard", kind_t::keyboard); }
+
+    // probe: check ps/2 controller is present by reading status port.
+    // a value of 0xff means no controller (floating bus).
+    bool probe() override {
+        auto s = read8(PORT_STATUS);
+        if (s.fail()) return false;       // bad port — shouldn't happen (0x64 is valid)
+        return s.value != 0xff;           // 0xff = no device
+    }
+
+    // start: flush stale bytes from output buffer, then enable scanning.
+    bool start() override {
+        // drain any leftover bytes (up to 16)
+        for (int i = 0; i < 16; ++i) {
+            auto st = read8(PORT_STATUS);
+            if (st.fail() || !(st.value & 0x01)) break;
+            read8(PORT_DATA); // discard
+        }
+
+        // send 0xf4 (enable scanning) to keyboard
+        // wait for input buffer empty first
+        if (!wait_ready(PORT_STATUS, 0x02, 0x00)) return false; // timeout
+        if (!write8(PORT_DATA, 0xf4))             return false; // bad port
+
+        return true;
+    }
+
+    // get_key: blocking read — waits for a keypress, returns the ascii char.
+    // handles port errors gracefully: on bad_port returns '\0' immediately;
+    // on other transient errors retries (pause + continue).
+    char get_key() {
+        while (true) {
+            // poll status — check output buffer full bit (bit 0)
+            auto st = read8(PORT_STATUS);
+            if (st.fail()) {
+                if (last_err == io::err::bad_port) return '\0'; // fatal
+                asm volatile("pause"); continue;
+            }
+            if (!(st.value & 0x01)) { asm volatile("pause"); continue; }
+
+            // read scancode
+            auto sc_r = read8(PORT_DATA);
+            if (sc_r.fail()) { asm volatile("pause"); continue; }
+            uint8_t sc = sc_r.value;
+
+            // shift make/break
+            if (sc == 0x2a || sc == 0x36) { shift = true;  continue; }
+            if (sc == 0xaa || sc == 0xb6) { shift = false; continue; }
+            // caps lock
+            if (sc == 0x3a) { caps = !caps; continue; }
+            // ignore break codes and extended scancodes
+            if (sc & 0x80) continue;
+            if (sc >= 128)  continue;
+
+            char base = keymap[sc];
+            if (!base) continue;
+
+            bool upper = shift;
+            if (caps && base >= 'a' && base <= 'z') upper = !upper;
+
+            return upper ? shifted[sc] : base;
+        }
+    }
+};
+
+// global keyboard instance — registered with drv::manager in entry.eixx
+static keyboard_t keyboard;
+
+} // namespace drv

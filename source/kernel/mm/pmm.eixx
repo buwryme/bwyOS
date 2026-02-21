@@ -1,0 +1,128 @@
+#pragma once
+#include <stdint.h>
+#include <stddef.h>
+
+#include "../../vendor/limine/limine.h"
+
+namespace pmm {
+
+// ── constants ─────────────────────────────────────────────────────────────
+static constexpr uint64_t page_size = 4096;
+
+// ── state ─────────────────────────────────────────────────────────────────
+static uint8_t* bitmap      = nullptr; // virtual (hhdm) address of bitmap
+static uint64_t total_pages = 0;
+static uint64_t used_pages  = 0;
+static uint64_t bitmap_pages = 0;
+
+// ── helpers ───────────────────────────────────────────────────────────────
+static inline void bit_set(uint64_t page) {
+    bitmap[page / 8] |=  (uint8_t)(1u << (page % 8));
+}
+static inline void bit_clr(uint64_t page) {
+    bitmap[page / 8] &= (uint8_t)~(1u << (page % 8));
+}
+static inline bool bit_get(uint64_t page) {
+    return (bitmap[page / 8] >> (page % 8)) & 1u;
+}
+
+// ── init ──────────────────────────────────────────────────────────────────
+// hhdm_offset MUST be provided upfront — we need it before the first write
+inline void init(limine_memmap_response* mmap, uint64_t hhdm_offset) {
+    // pass 1: find top of usable ram → total_pages
+    uint64_t top = 0;
+    for (uint64_t i = 0; i < mmap->entry_count; ++i) {
+        auto* e = mmap->entries[i];
+        if (e->type == LIMINE_MEMMAP_USABLE) {
+            uint64_t end = e->base + e->length;
+            if (end > top) top = end;
+        }
+    }
+    total_pages   = top / page_size;
+    uint64_t bitmap_bytes = (total_pages + 7) / 8;
+    bitmap_pages  = (bitmap_bytes + page_size - 1) / page_size;
+
+    // pass 2: find a usable region big enough for the bitmap
+    uint64_t bitmap_phys = 0;
+    for (uint64_t i = 0; i < mmap->entry_count; ++i) {
+        auto* e = mmap->entries[i];
+        if (e->type == LIMINE_MEMMAP_USABLE && e->length >= bitmap_bytes) {
+            bitmap_phys = e->base;
+            break;
+        }
+    }
+
+    // bitmap pointer is immediately the hhdm-mapped address so all writes work
+    bitmap = reinterpret_cast<uint8_t*>(bitmap_phys + hhdm_offset);
+
+    // mark everything used
+    for (uint64_t b = 0; b < bitmap_bytes; ++b) bitmap[b] = 0xff;
+    used_pages = total_pages;
+
+    // pass 3: free all usable pages
+    for (uint64_t i = 0; i < mmap->entry_count; ++i) {
+        auto* e = mmap->entries[i];
+        if (e->type != LIMINE_MEMMAP_USABLE) continue;
+        uint64_t pg_start = e->base / page_size;
+        uint64_t pg_count = e->length / page_size;
+        for (uint64_t p = pg_start; p < pg_start + pg_count; ++p) {
+            bit_clr(p);
+            --used_pages;
+        }
+    }
+
+    // re-mark bitmap's own pages as used
+    uint64_t bm_page = bitmap_phys / page_size;
+    for (uint64_t p = bm_page; p < bm_page + bitmap_pages; ++p) {
+        if (!bit_get(p)) { bit_set(p); ++used_pages; }
+    }
+}
+
+// ── alloc / free ──────────────────────────────────────────────────────────
+inline uint64_t alloc_page() {
+    for (uint64_t i = 0; i < total_pages; ++i) {
+        if (!bit_get(i)) {
+            bit_set(i);
+            ++used_pages;
+            return i;
+        }
+    }
+    return ~0ull;
+}
+
+inline uint64_t alloc_pages(uint64_t count) {
+    uint64_t run = 0, start = 0;
+    for (uint64_t i = 0; i < total_pages; ++i) {
+        if (!bit_get(i)) {
+            if (run == 0) start = i;
+            if (++run == count) {
+                for (uint64_t p = start; p < start + count; ++p) {
+                    bit_set(p);
+                    ++used_pages;
+                }
+                return start;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    return ~0ull;
+}
+
+inline void free_page(uint64_t page_idx) {
+    if (page_idx >= total_pages || !bit_get(page_idx)) return;
+    bit_clr(page_idx);
+    --used_pages;
+}
+
+inline void free_pages(uint64_t page_idx, uint64_t count) {
+    for (uint64_t i = page_idx; i < page_idx + count; ++i)
+        free_page(i);
+}
+
+// ── stats ─────────────────────────────────────────────────────────────────
+inline uint64_t free_page_count()  { return total_pages - used_pages; }
+inline uint64_t total_page_count() { return total_pages; }
+inline uint64_t used_page_count()  { return used_pages; }
+
+} // namespace pmm

@@ -1,0 +1,203 @@
+#pragma once
+#include <stdint.h>
+#include <stddef.h>
+#include "pmm.eixx"
+
+// ┌─────────────────────────────────────────────────────────────────────────┐
+// │  cascade allocator                                                      │
+// │                                                                         │
+// │  tiers (size → pool):                                                   │
+// │    ≤   8 b → slab[0]   (8 b cells)                                     │
+// │    ≤  16 b → slab[1]   (16 b cells)                                    │
+// │    ≤  32 b → slab[2]   (32 b cells)                                    │
+// │    ≤  64 b → slab[3]   (64 b cells)                                    │
+// │    ≤ 128 b → slab[4]   (128 b cells)                                   │
+// │    ≤ 256 b → slab[5]   (256 b cells)                                   │
+// │    ≤ 512 b → slab[6]   (512 b cells)                                   │
+// │    > 512 b → direct page alloc (large_header prefix, 16 b overhead)    │
+// └─────────────────────────────────────────────────────────────────────────┘
+
+namespace cascade {
+
+// ── hhdm ─────────────────────────────────────────────────────────────────
+static uint64_t hhdm_base = 0;
+
+static inline void* phys_to_virt(uint64_t phys) {
+    return reinterpret_cast<void*>(phys + hhdm_base);
+}
+
+// ── slab tiers ────────────────────────────────────────────────────────────
+static constexpr int    num_tiers  = 7;
+static constexpr size_t tier_size[num_tiers] = { 8, 16, 32, 64, 128, 256, 512 };
+
+struct freecell { freecell* next; };
+
+struct slab_pool {
+    freecell* head        = nullptr;
+    size_t    cell        = 0;
+    uint64_t  alloc_count = 0;
+    uint64_t  free_count  = 0;
+
+    void refill() {
+        uint64_t page_idx = pmm::alloc_page();
+        if (page_idx == ~0ull) return;
+        auto* page = reinterpret_cast<uint8_t*>(
+            phys_to_virt(page_idx * pmm::page_size));
+        size_t n = pmm::page_size / cell;
+        for (size_t i = 0; i < n; ++i) {
+            auto* fc = reinterpret_cast<freecell*>(page + i * cell);
+            fc->next = head;
+            head = fc;
+        }
+    }
+
+    void* alloc() {
+        if (!head) refill();
+        if (!head) return nullptr;
+        freecell* fc = head;
+        head = fc->next;
+        ++alloc_count;
+        return reinterpret_cast<void*>(fc);
+    }
+
+    void free(void* ptr) {
+        auto* fc = reinterpret_cast<freecell*>(ptr);
+        fc->next = head;
+        head = fc;
+        ++free_count;
+    }
+};
+
+static slab_pool pools[num_tiers];
+
+// ── large alloc header ────────────────────────────────────────────────────
+struct large_header {
+    uint64_t magic;
+    uint64_t page_count;
+};
+static constexpr uint64_t large_magic = 0xca5cade1ca5cadeull;
+
+// ── stats counters ────────────────────────────────────────────────────────
+static uint64_t large_alloc_count = 0;
+static uint64_t large_free_count  = 0;
+static uint64_t total_allocs      = 0;
+static uint64_t total_frees       = 0;
+
+// ── init ──────────────────────────────────────────────────────────────────
+inline void init(uint64_t hhdm_offset) {
+    hhdm_base = hhdm_offset;
+    for (int i = 0; i < num_tiers; ++i)
+        pools[i].cell = tier_size[i];
+}
+
+// ── kmalloc ───────────────────────────────────────────────────────────────
+inline void* kmalloc(size_t n) {
+    if (n == 0) return nullptr;
+    ++total_allocs;
+
+    for (int i = 0; i < num_tiers; ++i)
+        if (n <= tier_size[i])
+            return pools[i].alloc();
+
+    // large path
+    size_t   total  = n + sizeof(large_header);
+    uint64_t pages  = (total + pmm::page_size - 1) / pmm::page_size;
+    uint64_t first  = pmm::alloc_pages(pages);
+    if (first == ~0ull) return nullptr;
+
+    auto* hdr = reinterpret_cast<large_header*>(
+        phys_to_virt(first * pmm::page_size));
+    hdr->magic      = large_magic;
+    hdr->page_count = pages;
+    ++large_alloc_count;
+    return reinterpret_cast<void*>(hdr + 1);
+}
+
+// ── kfree ─────────────────────────────────────────────────────────────────
+inline void kfree(void* ptr) {
+    if (!ptr) return;
+    ++total_frees;
+
+    // large path: check header magic
+    auto* hdr = reinterpret_cast<large_header*>(ptr) - 1;
+    if (hdr->magic == large_magic) {
+        uint64_t phys     = reinterpret_cast<uint64_t>(hdr) - hhdm_base;
+        uint64_t page_idx = phys / pmm::page_size;
+        pmm::free_pages(page_idx, hdr->page_count);
+        hdr->magic = 0; // poison
+        ++large_free_count;
+        return;
+    }
+
+    // slab path: find pool by offset alignment
+    // each slab cell came from a page-aligned page, and tier sizes are all
+    // powers of two that divide 4096, so the in-page offset is a unique
+    // multiple of exactly one tier size (the smallest that divides it).
+    uintptr_t offset = reinterpret_cast<uintptr_t>(ptr) & (pmm::page_size - 1);
+    for (int i = 0; i < num_tiers; ++i) {
+        if ((offset % tier_size[i]) == 0) {
+            pools[i].free(ptr);
+            return;
+        }
+    }
+    // bad pointer — silently drop
+}
+
+// ── kcalloc / krealloc ────────────────────────────────────────────────────
+inline void* kcalloc(size_t n, size_t size) {
+    size_t total = n * size;
+    void* p = kmalloc(total);
+    if (!p) return nullptr;
+    uint8_t* b = reinterpret_cast<uint8_t*>(p);
+    for (size_t i = 0; i < total; ++i) b[i] = 0;
+    return p;
+}
+
+inline void* krealloc(void* old_ptr, size_t new_size) {
+    if (!old_ptr) return kmalloc(new_size);
+    if (!new_size) { kfree(old_ptr); return nullptr; }
+    void* np = kmalloc(new_size);
+    if (!np) return nullptr;
+    uint8_t* src = reinterpret_cast<uint8_t*>(old_ptr);
+    uint8_t* dst = reinterpret_cast<uint8_t*>(np);
+    for (size_t i = 0; i < new_size; ++i) dst[i] = src[i];
+    kfree(old_ptr);
+    return np;
+}
+
+// ── stats ─────────────────────────────────────────────────────────────────
+struct stats_t {
+    uint64_t total_allocs;
+    uint64_t total_frees;
+    uint64_t slab_allocs[num_tiers];
+    uint64_t slab_frees[num_tiers];
+    uint64_t large_allocs;
+    uint64_t large_frees;
+    uint64_t free_phys_pages;
+    uint64_t total_phys_pages;
+    uint64_t used_phys_pages;
+};
+
+inline stats_t get_stats() {
+    stats_t s;
+    s.total_allocs     = total_allocs;
+    s.total_frees      = total_frees;
+    s.large_allocs     = large_alloc_count;
+    s.large_frees      = large_free_count;
+    s.free_phys_pages  = pmm::free_page_count();
+    s.total_phys_pages = pmm::total_page_count();
+    s.used_phys_pages  = pmm::used_page_count();
+    for (int i = 0; i < num_tiers; ++i) {
+        s.slab_allocs[i] = pools[i].alloc_count;
+        s.slab_frees[i]  = pools[i].free_count;
+    }
+    return s;
+}
+
+} // namespace cascade
+
+// ── global wrappers ───────────────────────────────────────────────────────
+inline void* kmalloc(size_t n)             { return cascade::kmalloc(n); }
+inline void  kfree(void* p)                { cascade::kfree(p); }
+inline void* kcalloc(size_t n, size_t sz)  { return cascade::kcalloc(n, sz); }
+inline void* krealloc(void* p, size_t sz)  { return cascade::krealloc(p, sz); }

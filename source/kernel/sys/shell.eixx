@@ -1,0 +1,547 @@
+#pragma once
+
+#include <stdint.h>
+
+#include "../gfx/fb.eixx"
+#include "../gfx/kprint.eixx"
+#include "../drv/driver.eixx"
+#include "../drv/input/keyboard.eixx"
+#include "../sys/panic.eixx"
+#include "../mm/cascade.eixx"
+#include "../fs/vfs.eixx"
+
+namespace shell {
+
+// ── string utils ──────────────────────────────────────────────────────────
+
+static inline bool streq(const char* a, const char* b) {
+    while (*a && *b && *a == *b) { ++a; ++b; }
+    return *a == *b;
+}
+
+static inline int slen(const char* s) {
+    int i = 0; while (s[i]) ++i; return i;
+}
+
+static inline const char* match(const char* buf, const char* cmd) {
+    while (*cmd && *buf == *cmd) { ++buf; ++cmd; }
+    if (*cmd) return nullptr;
+    if (*buf == ' ') return buf + 1;
+    if (*buf == 0)   return buf;
+    return nullptr;
+}
+
+static inline uint64_t parse_u64(const char* s) {
+    if (!s || !*s) return ~0ull;
+    uint64_t v = 0;
+    const char* p = s;
+    while (*p >= '0' && *p <= '9') { v = v * 10 + (uint64_t)(*p - '0'); ++p; }
+    if (p == s || *p != '\0') return ~0ull;
+    return v;
+}
+
+static inline const char* strip_quotes(char* arg) {
+    if (!arg) return arg;
+    char q = arg[0];
+    if (q != '"' && q != '\'') return arg;
+    char* close = arg + 1;
+    while (*close && *close != q) ++close;
+    *close = '\0';
+    return arg + 1;
+}
+
+// copy src into dst, at most n-1 chars, always null-terminate
+static inline void sncopy(char* dst, const char* src, int n) {
+    int i = 0;
+    while (src[i] && i < n - 1) { dst[i] = src[i]; ++i; }
+    dst[i] = '\0';
+}
+
+// ── session state ─────────────────────────────────────────────────────────
+
+static vfs::node_t* cwd = nullptr; // initialised in run()
+
+// ── prompt helper ─────────────────────────────────────────────────────────
+
+static void print_prompt() {
+    char path[vfs::PATH_MAX];
+    vfs::pwd(cwd, path, vfs::PATH_MAX);
+    fb::print("root@bwyos:", fb::PROMPT);
+    fb::print(path,          fb::YELLOW);
+    fb::print("# ",          fb::PROMPT);
+}
+
+// ── redirection parser ────────────────────────────────────────────────────
+// scans buf for " > filename" or " >> filename" (not inside quotes).
+// if found: null-terminates buf before the '>', sets *out_file and *out_append.
+// returns true if redirection was found.
+
+static bool parse_redirect(char* buf, char** out_file, bool* out_append) {
+    *out_file   = nullptr;
+    *out_append = false;
+
+    bool in_quote = false;
+    char qchar    = 0;
+
+    for (char* p = buf; *p; ++p) {
+        if (!in_quote && (*p == '"' || *p == '\'')) { in_quote = true; qchar = *p; continue; }
+        if (in_quote && *p == qchar) { in_quote = false; continue; }
+        if (in_quote) continue;
+
+        if (*p == '>') {
+            // check for >>
+            *out_append = (*(p + 1) == '>');
+            // null-terminate the command part (trim trailing space)
+            char* end = p - 1;
+            while (end > buf && *end == ' ') --end;
+            *(end + 1) = '\0';
+
+            // skip > or >>
+            char* f = p + (*out_append ? 2 : 1);
+            while (*f == ' ') ++f;
+            *out_file = f;
+            // trim trailing whitespace from filename
+            char* fe = f + slen(f) - 1;
+            while (fe > f && *fe == ' ') { *fe = '\0'; --fe; }
+            return *f != '\0';
+        }
+    }
+    return false;
+}
+
+// ── output capture for redirection ───────────────────────────────────────
+// when redirecting, we swap fb::print to write into a buffer instead.
+// simple approach: capture buffer + flag, fb::print checks it.
+
+static char   redir_buf[vfs::FILE_MAX_SIZE];
+static int    redir_pos  = 0;
+static bool   redir_active = false;
+
+// called by the redirection-aware print wrapper below
+static void redir_write(const char* s) {
+    while (*s && redir_pos < vfs::FILE_MAX_SIZE - 1)
+        redir_buf[redir_pos++] = *s++;
+    redir_buf[redir_pos] = '\0';
+}
+
+// print wrapper: routes to redir_buf when active, else to fb
+static void pr(const char* s, uint32_t color = fb::FG) {
+    if (redir_active) redir_write(s);
+    else              fb::print(s, color);
+}
+
+// ── built-in commands ─────────────────────────────────────────────────────
+
+static void cmd_help() {
+    pr("commands: help  ls [path]  cat <file>  mkdir <dir>  touch <file>\n");
+    pr("          cd <dir>  pwd  rm <file>  echo <text> [> file]\n");
+    pr("          uname  whoami  date  fetch  clear  res\n");
+    pr("          meminfo  memtest  memstress  meminspect\n");
+    pr("          drivers\n");
+    pr("          panic [msg|vec#]  fault <ud|div|gpf|pf>\n");
+}
+
+// ── ls ────────────────────────────────────────────────────────────────────
+static void cmd_ls(const char* arg) {
+    vfs::err e;
+    vfs::node_t* target = (arg && *arg)
+        ? vfs::resolve(arg, cwd, &e)
+        : cwd;
+
+    if (!target) {
+        pr("ls: "); pr(arg, fb::RED); pr(": "); pr(vfs::err_str(e)); pr("\n");
+        return;
+    }
+    if (target->kind != vfs::node_kind::dir) {
+        // single file — just print it
+        pr(target->name, fb::GREEN); pr("\n");
+        return;
+    }
+
+    for (int i = 0; i < target->dir.count; ++i) {
+        vfs::node_t* child = target->dir.children[i];
+        if (child->kind == vfs::node_kind::dir) {
+            pr(child->name, fb::PROMPT);
+            pr("/  ", fb::PROMPT);
+        } else {
+            pr(child->name, fb::GREEN);
+            pr("  ");
+        }
+    }
+    if (target->dir.count > 0) pr("\n");
+}
+
+// ── cat ───────────────────────────────────────────────────────────────────
+static void cmd_cat(const char* arg) {
+    if (!arg || !*arg) { pr("usage: cat <file>\n", fb::RED); return; }
+
+    vfs::err e;
+    const char* content = vfs::read_file(arg, cwd, &e);
+    if (!content) {
+        pr("cat: ", fb::RED); pr(arg, fb::RED);
+        pr(": ", fb::RED); pr(vfs::err_str(e), fb::RED); pr("\n", fb::RED);
+        return;
+    }
+    pr(content);
+    // ensure newline at end
+    if (content[0] && content[slen(content)-1] != '\n') pr("\n");
+}
+
+// ── mkdir ─────────────────────────────────────────────────────────────────
+static void cmd_mkdir(const char* arg) {
+    if (!arg || !*arg) { pr("usage: mkdir <dir>\n", fb::RED); return; }
+    vfs::err e = vfs::mkdir(arg, cwd);
+    if (e != vfs::err::ok) {
+        pr("mkdir: ", fb::RED); pr(arg, fb::RED);
+        pr(": ", fb::RED); pr(vfs::err_str(e), fb::RED); pr("\n");
+    }
+}
+
+// ── touch ─────────────────────────────────────────────────────────────────
+static void cmd_touch(const char* arg) {
+    if (!arg || !*arg) { pr("usage: touch <file>\n", fb::RED); return; }
+    vfs::err e = vfs::touch(arg, cwd);
+    if (e != vfs::err::ok) {
+        pr("touch: ", fb::RED); pr(arg, fb::RED);
+        pr(": ", fb::RED); pr(vfs::err_str(e), fb::RED); pr("\n");
+    }
+}
+
+// ── cd ────────────────────────────────────────────────────────────────────
+static void cmd_cd(const char* arg) {
+    const char* path = (arg && *arg) ? arg : "/";
+    vfs::err e;
+    vfs::node_t* next = vfs::cd(path, cwd, &e);
+    if (!next) {
+        pr("cd: ", fb::RED); pr(path, fb::RED);
+        pr(": ", fb::RED); pr(vfs::err_str(e), fb::RED); pr("\n");
+        return;
+    }
+    cwd = next;
+}
+
+// ── pwd ───────────────────────────────────────────────────────────────────
+static void cmd_pwd() {
+    char buf[vfs::PATH_MAX];
+    vfs::pwd(cwd, buf, vfs::PATH_MAX);
+    pr(buf); pr("\n");
+}
+
+// ── echo ──────────────────────────────────────────────────────────────────
+// echo handles its own redirection inline (the shell dispatch also handles
+// the "echo text > file" form via parse_redirect before dispatch)
+static void cmd_echo(const char* arg) {
+    if (!arg) arg = "";
+    const char* s = arg;
+    if ((*s == '"' || *s == '\'')) {
+        // strip quotes for display (non-destructive here since arg is const)
+        static char tmp[256];
+        sncopy(tmp, s + 1, 255);
+        int len = slen(tmp);
+        if (len > 0 && (tmp[len-1] == '"' || tmp[len-1] == '\''))
+            tmp[len-1] = '\0';
+        pr(tmp); pr("\n");
+    } else {
+        pr(s); pr("\n");
+    }
+}
+
+// ── rm ────────────────────────────────────────────────────────────────────
+static void cmd_rm(const char* arg) {
+    if (!arg || !*arg) { pr("usage: rm <file>\n", fb::RED); return; }
+
+    vfs::err e;
+    vfs::node_t* n = vfs::resolve(arg, cwd, &e);
+    if (!n) {
+        pr("rm: ", fb::RED); pr(arg, fb::RED);
+        pr(": ", fb::RED); pr(vfs::err_str(e), fb::RED); pr("\n");
+        return;
+    }
+    if (n->kind == vfs::node_kind::dir && n->dir.count > 0) {
+        pr("rm: ", fb::RED); pr(arg, fb::RED);
+        pr(": is a non-empty directory\n", fb::RED);
+        return;
+    }
+    // unlink from parent
+    vfs::node_t* parent = n->parent;
+    for (int i = 0; i < parent->dir.count; ++i) {
+        if (parent->dir.children[i] == n) {
+            // shift remaining children
+            for (int j = i; j < parent->dir.count - 1; ++j)
+                parent->dir.children[j] = parent->dir.children[j+1];
+            parent->dir.count--;
+            break;
+        }
+    }
+    // return node to pool
+    for (int i = 0; i < vfs::MAX_NODES; ++i) {
+        if (&vfs::pool[i] == n) { vfs::pool_used[i] = false; break; }
+    }
+}
+
+// ── drivers ───────────────────────────────────────────────────────────────
+static void cmd_drivers() {
+    pr("── registered drivers ───────────────────\n", fb::YELLOW);
+    if (drv::manager.count == 0) {
+        pr("  (none)\n", fb::GRAY); return;
+    }
+    for (int i = 0; i < drv::manager.count; ++i) {
+        drv::driver_t* d = drv::manager.drivers[i];
+        pr("  ["); pr(drv::kind_str(d->kind), fb::PURPLE); pr("]  ");
+        pr(d->name, fb::FG);
+        pr(d->started ? "  ok\n" : "  stopped\n",
+           d->started ? fb::GREEN : fb::GRAY);
+    }
+}
+
+// ── res ───────────────────────────────────────────────────────────────────
+static void cmd_res() {
+    kprint::str("resolution : ");
+    kprint::u64(fb::width,  fb::GREEN);
+    kprint::str("x");
+    kprint::u64(fb::height, fb::GREEN);
+    kprint::str("  pitch: ");
+    kprint::u64(fb::pitch,  fb::GRAY);
+    kprint::str("  bpp: ");
+    uint64_t bpp = (fb::width > 0) ? (fb::pitch / fb::width * 8) : 0;
+    kprint::u64(bpp, fb::GRAY);
+    kprint::nl();
+}
+
+// ── uname / whoami / date / fetch / clear ────────────────────────────────
+static void cmd_uname()  { pr("bwyos 0.3.0 x86_64\n"); }
+static void cmd_whoami() { pr("root\n"); }
+static void cmd_date()   { pr("sat feb 21 00:00:00 utc 2026\n"); }
+
+static void cmd_fetch() {
+    fb::print("   *   ",  fb::PURPLE); fb::print("os:     ", fb::GRAY); fb::print("bwyos 0.3.0\n",          fb::FG);
+    fb::print("  / \\  ",  fb::PURPLE); fb::print("krnl:   ", fb::GRAY); fb::print("bwy.kernel\n",           fb::FG);
+    fb::print(" *---* ",  fb::PURPLE); fb::print("alloc:  ", fb::GRAY); fb::print("cascade + pmm\n",         fb::FG);
+    fb::print("  \\ /  ",  fb::PURPLE); fb::print("vfs:    ", fb::GRAY); fb::print("bwy.vfs (in-memory)\n",  fb::FG);
+    fb::print("   *   ",  fb::PURPLE); fb::print("drv:    ", fb::GRAY); fb::print("bwy.iokit\n",             fb::FG);
+    fb::print("       ",  fb::PURPLE); fb::print("sh:     ", fb::GRAY); fb::print("bwy.sh\n\n",              fb::FG);
+}
+
+static void cmd_clear() { fb::clear(); fb::cur_x = fb::cur_y = 0; }
+
+// ── meminfo / memtest / memstress / meminspect ────────────────────────────
+static void cmd_meminfo() {
+    auto s = cascade::get_stats();
+    uint64_t ps = pmm::page_size;
+    fb::print("── physical memory ──────────────────\n", fb::YELLOW);
+    kprint::str("  total : "); kprint::bytes(s.total_phys_pages * ps); kprint::nl();
+    kprint::str("  used  : "); kprint::bytes(s.used_phys_pages  * ps); kprint::nl();
+    kprint::str("  free  : "); kprint::bytes(s.free_phys_pages  * ps); kprint::nl();
+    fb::print("── cascade slab pools ───────────────\n", fb::YELLOW);
+    static constexpr size_t ts[cascade::num_tiers] = {8,16,32,64,128,256,512};
+    for (int i = 0; i < cascade::num_tiers; ++i) {
+        kprint::str("  ["); kprint::u64(ts[i]); kprint::str("b]  alloc=");
+        kprint::u64(s.slab_allocs[i], fb::GREEN);
+        kprint::str("  free="); kprint::u64(s.slab_frees[i], fb::RED); kprint::nl();
+    }
+    fb::print("── large allocs (>512b) ─────────────\n", fb::YELLOW);
+    kprint::str("  alloc="); kprint::u64(s.large_allocs, fb::GREEN);
+    kprint::str("  free=");  kprint::u64(s.large_frees,  fb::RED); kprint::nl();
+    fb::print("── totals ───────────────────────────\n", fb::YELLOW);
+    kprint::str("  kmalloc calls : "); kprint::u64(s.total_allocs, fb::GREEN); kprint::nl();
+    kprint::str("  kfree   calls : "); kprint::u64(s.total_frees,  fb::RED);   kprint::nl();
+}
+
+static void cmd_memtest() {
+    fb::print("cascade allocator test\n", fb::YELLOW);
+    static constexpr uint8_t pat[cascade::num_tiers] = {0xaa,0xbb,0xcc,0xdd,0xee,0xff,0x42};
+    static constexpr size_t sizes[cascade::num_tiers] = {8,16,32,64,128,256,512};
+    bool all_ok = true;
+    for (int t = 0; t < cascade::num_tiers; ++t) {
+        size_t sz = sizes[t]; void* p = kmalloc(sz);
+        if (!p) { kprint::str("  ["); kprint::u64(sz); kprint::str("b] FAIL: null\n", fb::RED); all_ok = false; continue; }
+        uint8_t* b = reinterpret_cast<uint8_t*>(p);
+        for (size_t i = 0; i < sz; ++i) b[i] = pat[t];
+        bool ok = true;
+        for (size_t i = 0; i < sz; ++i) if (b[i] != pat[t]) { ok = false; break; }
+        kprint::str("  ["); kprint::u64(sz); kprint::str("b] ");
+        if (ok) { fb::print("ok  ", fb::GREEN); kprint::str("ptr="); kprint::hex(reinterpret_cast<uint64_t>(p)); kprint::nl(); }
+        else    { fb::print("FAIL\n", fb::RED); all_ok = false; }
+        kfree(p);
+    }
+    fb::print(all_ok ? "all tests passed\n" : "some tests FAILED\n", all_ok ? fb::GREEN : fb::RED);
+}
+
+static void cmd_memstress() {
+    fb::print("stress test: 64 allocs across tiers...\n", fb::YELLOW);
+    static void* ptrs[64];
+    static constexpr size_t ss[] = {7,8,15,16,31,32,63,64,127,128,255,256,511,512,600,1024,2048,4000};
+    static constexpr int ns = 18;
+    int alloc_ok = 0;
+    for (int i = 0; i < 64; ++i) {
+        ptrs[i] = kmalloc(ss[i % ns]);
+        if (ptrs[i]) { *reinterpret_cast<uint8_t*>(ptrs[i]) = (uint8_t)(i & 0xff); ++alloc_ok; }
+    }
+    kprint::str("  allocated: "); kprint::u64(alloc_ok, fb::GREEN); kprint::str("/64\n");
+    int vok = 0;
+    for (int i = 0; i < 64; ++i)
+        if (ptrs[i] && *reinterpret_cast<uint8_t*>(ptrs[i]) == (uint8_t)(i & 0xff)) ++vok;
+    kprint::str("  verified:  "); kprint::u64(vok, fb::GREEN); kprint::str("/64\n");
+    int fok = 0;
+    for (int i = 0; i < 64; ++i) if (ptrs[i]) { kfree(ptrs[i]); ptrs[i] = nullptr; ++fok; }
+    kprint::str("  freed:     "); kprint::u64(fok, fb::GREEN); kprint::str("/64\n");
+    fb::print("stress test complete\n", fb::GREEN);
+}
+
+static void cmd_meminspect() {
+    fb::print("allocating 8b, 64b, 512b, 4096b...\n", fb::YELLOW);
+    size_t szs[] = {8, 64, 512, 4096};
+    for (int i = 0; i < 4; ++i) {
+        void* p = kmalloc(szs[i]);
+        kprint::str("  kmalloc("); kprint::u64(szs[i]); kprint::str(") = ");
+        if (p) { kprint::hex(reinterpret_cast<uint64_t>(p)); kprint::nl(); }
+        else   { fb::print("null\n", fb::RED); }
+        kfree(p);
+    }
+}
+
+// ── panic ─────────────────────────────────────────────────────────────────
+[[noreturn]] static void cmd_panic(char* arg) {
+    if (!arg || !*arg)                     panic::kpanic("user-requested panic");
+    if (arg[0] == '"' || arg[0] == '\'')   panic::kpanic(strip_quotes(arg));
+    uint64_t vec = parse_u64(arg);
+    if (vec != ~0ull)  panic::kpanic_exception("user-triggered exception panic", vec, nullptr);
+    panic::kpanic(arg);
+}
+
+// ── fault ─────────────────────────────────────────────────────────────────
+static void cmd_fault(const char* arg) {
+    if (!arg || !*arg) {
+        fb::print("usage: fault <ud|div|gpf|pf>\n", fb::YELLOW);
+        return;
+    }
+    if (streq(arg, "ud"))  { fb::print("triggering #ud...\n", fb::YELLOW); asm volatile("ud2"); }
+    else if (streq(arg, "div")) {
+        fb::print("triggering #de...\n", fb::YELLOW);
+        volatile int z = 0; volatile int r = 1/z; (void)r;
+    } else if (streq(arg, "gpf")) {
+        fb::print("triggering #gp...\n", fb::YELLOW);
+        asm volatile("mov $0x1234,%%ax; mov %%ax,%%ds" ::: "ax");
+    } else if (streq(arg, "pf")) {
+        fb::print("triggering #pf...\n", fb::YELLOW);
+        volatile uint64_t* np = reinterpret_cast<volatile uint64_t*>(0x0);
+        volatile uint64_t  v  = *np; (void)v;
+    } else {
+        fb::print("valid: ud  div  gpf  pf\n", fb::GRAY);
+    }
+}
+
+// ── secret ────────────────────────────────────────────────────────────────
+[[noreturn]] static void cmd_67() {
+    static char msg[] = "67 diddy epstein — 67 67 67 67 67";
+    panic::kpanic(msg);
+}
+
+// ── run ───────────────────────────────────────────────────────────────────
+inline void run() {
+    cwd = vfs::get_root();
+
+    static char buf[256];
+    uint32_t pos = 0;
+
+    fb::print("bwy.kernel v0.3.0 (bwy.sh)\n", fb::GREEN);
+    fb::print("vfs + iokit ready\n",           fb::PURPLE);
+    fb::print("type 'help' for commands.\n\n");
+
+    // get keyboard from driver manager
+    drv::keyboard_t* kbd = reinterpret_cast<drv::keyboard_t*>(
+        drv::manager.find(drv::kind_t::keyboard));
+
+    while (true) {
+        print_prompt();
+        pos = 0;
+
+        while (true) {
+            char c = kbd ? kbd->get_key() : '\0';
+            if (c == '\n') {
+                buf[pos] = '\0'; fb::print("\n"); break;
+            } else if (c == '\b') {
+                if (pos > 0) { --pos; fb::backspace(); }
+            } else if (pos < 255 && c >= 32) {
+                buf[pos++] = c;
+                fb::draw_char(fb::cur_x, fb::cur_y, c, fb::FG);
+                fb::cur_x += 8;
+                if (fb::cur_x + 8 > fb::width) fb::newline();
+            }
+        }
+
+        if (pos == 0) continue;
+
+        // ── redirection check ─────────────────────────────────────────────
+        char* redir_file  = nullptr;
+        bool  redir_append = false;
+        bool  has_redir   = parse_redirect(buf, &redir_file, &redir_append);
+
+        if (has_redir) {
+            redir_active = true;
+            redir_pos    = 0;
+            redir_buf[0] = '\0';
+        }
+
+        // ── dispatch ──────────────────────────────────────────────────────
+        char* arg;
+        if      (streq(buf, "help"))          cmd_help();
+        else if (streq(buf, "ls"))            cmd_ls(nullptr);
+        else if ((arg = const_cast<char*>(match(buf, "ls")))      != nullptr) cmd_ls(arg);
+        else if ((arg = const_cast<char*>(match(buf, "cat")))     != nullptr) cmd_cat(arg);
+        else if ((arg = const_cast<char*>(match(buf, "mkdir")))   != nullptr) cmd_mkdir(arg);
+        else if ((arg = const_cast<char*>(match(buf, "touch")))   != nullptr) cmd_touch(arg);
+        else if ((arg = const_cast<char*>(match(buf, "cd")))      != nullptr) cmd_cd(arg);
+        else if (streq(buf, "cd"))            cmd_cd("/");
+        else if (streq(buf, "pwd"))           cmd_pwd();
+        else if ((arg = const_cast<char*>(match(buf, "rm")))      != nullptr) cmd_rm(arg);
+        else if ((arg = const_cast<char*>(match(buf, "echo")))    != nullptr) cmd_echo(arg);
+        else if (streq(buf, "echo"))          cmd_echo("");
+        else if (streq(buf, "uname"))         cmd_uname();
+        else if (streq(buf, "whoami"))        cmd_whoami();
+        else if (streq(buf, "date"))          cmd_date();
+        else if (streq(buf, "fetch"))         cmd_fetch();
+        else if (streq(buf, "clear"))         cmd_clear();
+        else if (streq(buf, "drivers"))       cmd_drivers();
+        else if (streq(buf, "res"))           cmd_res();
+        else if (streq(buf, "meminfo"))       cmd_meminfo();
+        else if (streq(buf, "memtest"))       cmd_memtest();
+        else if (streq(buf, "memstress"))     cmd_memstress();
+        else if (streq(buf, "meminspect"))    cmd_meminspect();
+        else if (streq(buf, "67"))            cmd_67();
+        else if ((arg = const_cast<char*>(match(buf, "panic")))   != nullptr) cmd_panic(arg);
+        else if (streq(buf, "panic"))         cmd_panic(nullptr);
+        else if ((arg = const_cast<char*>(match(buf, "fault")))   != nullptr) cmd_fault(arg);
+        else {
+            fb::print("bwy.sh: not found: ", fb::RED);
+            fb::print(buf, fb::RED); fb::print("\n");
+        }
+
+        // ── flush redirection buffer to vfs ──────────────────────────────
+        if (has_redir && redir_active) {
+            redir_active = false;
+            if (redir_file && *redir_file) {
+                if (redir_append) {
+                    // append: read existing, concatenate
+                    vfs::err re;
+                    const char* existing = vfs::read_file(redir_file, cwd, &re);
+                    static char append_buf[vfs::FILE_MAX_SIZE];
+                    int pos2 = 0;
+                    if (existing && re == vfs::err::ok) {
+                        int elen = slen(existing);
+                        for (int i = 0; i < elen && pos2 < vfs::FILE_MAX_SIZE - 1; ++i)
+                            append_buf[pos2++] = existing[i];
+                    }
+                    for (int i = 0; i < redir_pos && pos2 < vfs::FILE_MAX_SIZE - 1; ++i)
+                        append_buf[pos2++] = redir_buf[i];
+                    append_buf[pos2] = '\0';
+                    vfs::write_file(redir_file, cwd, append_buf);
+                } else {
+                    vfs::write_file(redir_file, cwd, redir_buf);
+                }
+            }
+        }
+    }
+}
+
+} // namespace shell

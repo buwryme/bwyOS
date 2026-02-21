@@ -1,0 +1,58 @@
+#pragma once
+#include <stdint.h>
+
+namespace gdt {
+
+struct [[gnu::packed]] entry_t {
+    uint16_t limit_low;
+    uint16_t base_low;
+    uint8_t  base_mid;
+    uint8_t  access;
+    uint8_t  granularity;
+    uint8_t  base_high;
+};
+
+struct [[gnu::packed]] ptr_t {
+    uint16_t limit;
+    uint64_t base;
+};
+
+static entry_t table[3];
+static ptr_t   gdtr;
+
+static inline void set_entry(int i, uint32_t base, uint32_t limit,
+                              uint8_t access, uint8_t gran) {
+    table[i].base_low  = base & 0xffff;
+    table[i].base_mid  = (base >> 16) & 0xff;
+    table[i].base_high = (base >> 24) & 0xff;
+    table[i].limit_low  = limit & 0xffff;
+    table[i].granularity = ((limit >> 16) & 0x0f) | (gran & 0xf0);
+    table[i].access      = access;
+}
+
+inline void init() {
+    set_entry(0, 0, 0,          0x00, 0x00); // null
+    set_entry(1, 0, 0xffffffff, 0x9a, 0xa0); // kernel code (64-bit)
+    set_entry(2, 0, 0xffffffff, 0x92, 0xa0); // kernel data
+
+    gdtr.limit = sizeof(table) - 1;
+    gdtr.base  = (uint64_t)&table;
+
+    asm volatile(
+        "lgdt %0\n\t"
+        "pushq $0x08\n\t"
+        "leaq 1f(%%rip), %%rax\n\t"
+        "pushq %%rax\n\t"
+        "lretq\n\t"
+        "1:\n\t"
+        "movw $0x10, %%ax\n\t"
+        "movw %%ax, %%ds\n\t"
+        "movw %%ax, %%es\n\t"
+        "movw %%ax, %%fs\n\t"
+        "movw %%ax, %%gs\n\t"
+        "movw %%ax, %%ss\n\t"
+        : : "m"(gdtr) : "rax", "memory"
+    );
+}
+
+} // namespace gdt

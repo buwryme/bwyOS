@@ -1,0 +1,395 @@
+#pragma once
+#include <stdint.h>
+#include <stddef.h>
+
+// ── vfs — in-memory virtual file system ──────────────────────────────────
+//
+// design:
+//   - flat node pool allocated from the cascade heap (kmalloc/kfree)
+//   - each node is either a FILE or DIR
+//   - dirs hold up to DIR_CAPACITY child node pointers
+//   - files hold up to FILE_MAX_SIZE bytes of inline content (in the node)
+//   - paths are unix-style absolute ("/home/user/file.txt") or relative
+//   - cwd is tracked per-shell session (passed into resolve)
+//
+// limits (all static, no dynamic realloc needed):
+//   MAX_NODES       256  total nodes in the system
+//   DIR_CAPACITY     32  children per directory
+//   FILE_MAX_SIZE  1024  bytes per file (inline storage)
+//   NAME_MAX         64  chars per filename
+//   PATH_MAX        256  chars per full path
+
+namespace vfs {
+
+static constexpr int  MAX_NODES      = 256;
+static constexpr int  DIR_CAPACITY   = 32;
+static constexpr int  FILE_MAX_SIZE  = 1024;
+static constexpr int  NAME_MAX       = 64;
+static constexpr int  PATH_MAX       = 256;
+
+// ── node_t ────────────────────────────────────────────────────────────────
+
+enum class node_kind : uint8_t { file, dir };
+
+struct node_t {
+    char       name[NAME_MAX];
+    node_kind  kind;
+    node_t*    parent;
+
+    union {
+        struct {
+            char    data[FILE_MAX_SIZE];
+            uint32_t size;
+        } file;
+
+        struct {
+            node_t* children[DIR_CAPACITY];
+            uint8_t count;
+        } dir;
+    };
+};
+
+// ── error codes ───────────────────────────────────────────────────────────
+
+enum class err : uint8_t {
+    ok          = 0,
+    not_found   = 1,
+    exists      = 2,
+    not_dir     = 3,
+    not_file    = 4,
+    no_space    = 5,   // node pool or dir full
+    name_too_long = 6,
+    overflow    = 7,   // file write would exceed FILE_MAX_SIZE
+    bad_path    = 8,
+};
+
+#pragma clang diagnostic ignored "-Wunused-function"
+static inline const char* err_str(err e) {
+    switch (e) {
+        case err::ok:            return "ok";
+        case err::not_found:     return "no such file or directory";
+        case err::exists:        return "already exists";
+        case err::not_dir:       return "not a directory";
+        case err::not_file:      return "not a file";
+        case err::no_space:      return "no space left";
+        case err::name_too_long: return "name too long";
+        case err::overflow:      return "file too large";
+        case err::bad_path:      return "bad path";
+        default:                 return "unknown error";
+    }
+}
+
+// ── node pool ─────────────────────────────────────────────────────────────
+
+static node_t  pool[MAX_NODES];
+static bool    pool_used[MAX_NODES];
+static node_t* root;
+
+static node_t* alloc_node() {
+    for (int i = 0; i < MAX_NODES; ++i) {
+        if (!pool_used[i]) {
+            pool_used[i] = true;
+            // zero the node
+            node_t* n = &pool[i];
+            for (int j = 0; j < NAME_MAX; ++j) n->name[j] = 0;
+            n->parent = nullptr;
+            return n;
+        }
+    }
+    return nullptr;
+}
+
+static void free_node(node_t* n) {
+    if (!n) return;
+    for (int i = 0; i < MAX_NODES; ++i) {
+        if (&pool[i] == n) { pool_used[i] = false; return; }
+    }
+}
+
+// ── string helpers (no stdlib) ─────────────────────────────────────────────
+
+static inline int slen(const char* s) {
+    int i = 0; while (s[i]) ++i; return i;
+}
+
+static inline bool seq(const char* a, const char* b) {
+    while (*a && *b && *a == *b) { ++a; ++b; }
+    return *a == *b;
+}
+
+static inline void scopy(char* dst, const char* src, int max) {
+    int i = 0;
+    while (src[i] && i < max - 1) { dst[i] = src[i]; ++i; }
+    dst[i] = '\0';
+}
+
+static inline void smemcpy(char* dst, const char* src, int n) {
+    for (int i = 0; i < n; ++i) dst[i] = src[i];
+}
+
+// ── path tokeniser ─────────────────────────────────────────────────────────
+// splits path into components in-place. returns number of components.
+// writes component pointers + lengths into out[]. modifies scratch buffer.
+
+struct path_tok {
+    char  scratch[PATH_MAX];
+    const char* parts[32];
+    int   nparts;
+
+    void parse(const char* path) {
+        nparts = 0;
+        scopy(scratch, path, PATH_MAX);
+        char* p = scratch;
+        while (*p) {
+            while (*p == '/') ++p;          // skip slashes
+            if (!*p) break;
+            parts[nparts++] = p;
+            while (*p && *p != '/') ++p;   // advance to next slash
+            if (*p == '/') *p++ = '\0';    // null-terminate component
+            if (nparts >= 32) break;
+        }
+    }
+};
+
+// ── init ──────────────────────────────────────────────────────────────────
+
+inline void init() {
+    for (int i = 0; i < MAX_NODES; ++i) pool_used[i] = false;
+
+    // create root dir "/"
+    root = alloc_node();
+    root->kind        = node_kind::dir;
+    root->name[0]     = '/'; root->name[1] = '\0';
+    root->parent      = root; // root's parent is itself
+    root->dir.count   = 0;
+
+    // seed standard dirs
+    auto mkd = [](node_t* parent, const char* name) -> node_t* {
+        node_t* n  = alloc_node();
+        n->kind    = node_kind::dir;
+        scopy(n->name, name, NAME_MAX);
+        n->parent  = parent;
+        n->dir.count = 0;
+        parent->dir.children[parent->dir.count++] = n;
+        return n;
+    };
+
+    node_t* bin  = mkd(root, "bin");
+    node_t* dev  = mkd(root, "dev");
+    node_t* etc  = mkd(root, "etc");
+    node_t* home = mkd(root, "home");
+    node_t* usr  = mkd(root, "usr");
+    (void)bin; (void)dev; (void)usr;
+
+    // seed /etc/limine.conf
+    auto mkf = [](node_t* parent, const char* name, const char* content) -> node_t* {
+        node_t* n  = alloc_node();
+        n->kind    = node_kind::file;
+        scopy(n->name, name, NAME_MAX);
+        n->parent  = parent;
+        int len = slen(content);
+        if (len >= FILE_MAX_SIZE) len = FILE_MAX_SIZE - 1;
+        smemcpy(n->file.data, content, len);
+        n->file.data[len] = '\0';
+        n->file.size = (uint32_t)len;
+        parent->dir.children[parent->dir.count++] = n;
+        return n;
+    };
+
+    mkf(etc, "limine.conf", "timeout: 0\n\n/bwyos\n    protocol: limine\n    path: boot():/bin/kernel.bin\n");
+
+    // seed /home/bwy
+    node_t* bwy = mkd(home, "bwy");
+    mkf(bwy, ".profile", "# bwy user profile\nexport PATH=/bin:/usr/bin\n");
+
+    // kernel.bin placeholder in /bin
+    mkf(bin, "kernel.bin", "[binary]\n");
+}
+
+// ── node lookup ───────────────────────────────────────────────────────────
+
+// find a child of dir by name
+static node_t* dir_child(node_t* dir, const char* name) {
+    if (dir->kind != node_kind::dir) return nullptr;
+    for (int i = 0; i < dir->dir.count; ++i) {
+        if (seq(dir->dir.children[i]->name, name))
+            return dir->dir.children[i];
+    }
+    return nullptr;
+}
+
+// resolve an absolute or relative path from `cwd`.
+// returns the node, or nullptr + sets *out_err on failure.
+static node_t* resolve(const char* path, node_t* cwd, err* out_err = nullptr) {
+    auto seterr = [&](err e) -> node_t* { if (out_err) *out_err = e; return nullptr; };
+
+    if (!path || !*path) return seterr(err::bad_path);
+
+    node_t* cur = (path[0] == '/') ? root : cwd;
+
+    path_tok tok;
+    tok.parse(path);
+
+    for (int i = 0; i < tok.nparts; ++i) {
+        const char* part = tok.parts[i];
+        if (seq(part, "."))  continue;
+        if (seq(part, "..")) { cur = cur->parent; continue; }
+        if (cur->kind != node_kind::dir) return seterr(err::not_dir);
+        node_t* next = dir_child(cur, part);
+        if (!next) return seterr(err::not_found);
+        cur = next;
+    }
+
+    if (out_err) *out_err = err::ok;
+    return cur;
+}
+
+// resolve parent dir + extract final component name from path
+static node_t* resolve_parent(const char* path, node_t* cwd,
+                               const char** out_name, err* out_err = nullptr) {
+    #pragma clang diagnostic ignored "-Wunused-variable"
+    auto seterr = [&](err e) -> node_t* { if (out_err) *out_err = e; return nullptr; };
+
+    // find last '/'
+    int len = slen(path);
+    int last_slash = -1;
+    for (int i = len - 1; i >= 0; --i) {
+        if (path[i] == '/') { last_slash = i; break; }
+    }
+
+    static char parent_buf[PATH_MAX];
+    static char name_buf[NAME_MAX];
+
+    if (last_slash < 0) {
+        // no slash — parent is cwd
+        scopy(name_buf, path, NAME_MAX);
+        *out_name = name_buf;
+        if (out_err) *out_err = err::ok;
+        return cwd;
+    }
+
+    // copy parent portion
+    int plen = last_slash == 0 ? 1 : last_slash;
+    scopy(parent_buf, path, plen + 1);
+    parent_buf[plen] = '\0';
+
+    scopy(name_buf, path + last_slash + 1, NAME_MAX);
+    *out_name = name_buf;
+
+    return resolve(parent_buf, cwd, out_err);
+}
+
+// ── public api ────────────────────────────────────────────────────────────
+
+// mkdir — create directory at path
+inline err mkdir(const char* path, node_t* cwd) {
+    const char* name;
+    err e;
+    node_t* parent = resolve_parent(path, cwd, &name, &e);
+    if (!parent) return e;
+    if (parent->kind != node_kind::dir) return err::not_dir;
+    if (slen(name) == 0) return err::bad_path;
+    if (slen(name) >= NAME_MAX) return err::name_too_long;
+    if (dir_child(parent, name)) return err::exists;
+    if (parent->dir.count >= DIR_CAPACITY) return err::no_space;
+
+    node_t* n   = alloc_node();
+    if (!n) return err::no_space;
+    n->kind     = node_kind::dir;
+    scopy(n->name, name, NAME_MAX);
+    n->parent   = parent;
+    n->dir.count = 0;
+    parent->dir.children[parent->dir.count++] = n;
+    return err::ok;
+}
+
+// touch — create empty file (or update: no-op if exists)
+inline err touch(const char* path, node_t* cwd) {
+    const char* name;
+    err e;
+    node_t* parent = resolve_parent(path, cwd, &name, &e);
+    if (!parent) return e;
+    if (parent->kind != node_kind::dir) return err::not_dir;
+    if (slen(name) == 0) return err::bad_path;
+    if (slen(name) >= NAME_MAX) return err::name_too_long;
+    if (dir_child(parent, name)) return err::ok; // already exists — no-op
+    if (parent->dir.count >= DIR_CAPACITY) return err::no_space;
+
+    node_t* n  = alloc_node();
+    if (!n) return err::no_space;
+    n->kind    = node_kind::file;
+    scopy(n->name, name, NAME_MAX);
+    n->parent  = parent;
+    n->file.size = 0;
+    n->file.data[0] = '\0';
+    parent->dir.children[parent->dir.count++] = n;
+    return err::ok;
+}
+
+// write_file — write content to file (creates if needed, overwrites)
+inline err write_file(const char* path, node_t* cwd, const char* content) {
+    // try to find existing node
+    err e;
+    node_t* n = resolve(path, cwd, &e);
+    if (!n) {
+        // create it
+        e = touch(path, cwd);
+        if (e != err::ok) return e;
+        n = resolve(path, cwd, &e);
+        if (!n) return e;
+    }
+    if (n->kind != node_kind::file) return err::not_file;
+
+    int len = slen(content);
+    if (len >= FILE_MAX_SIZE) return err::overflow;
+    smemcpy(n->file.data, content, len + 1);
+    n->file.size = (uint32_t)len;
+    return err::ok;
+}
+
+// read_file — returns pointer to file content, or nullptr on error
+inline const char* read_file(const char* path, node_t* cwd, err* out_err = nullptr) {
+    err e;
+    node_t* n = resolve(path, cwd, &e);
+    if (!n) { if (out_err) *out_err = e; return nullptr; }
+    if (n->kind != node_kind::file) { if (out_err) *out_err = err::not_file; return nullptr; }
+    if (out_err) *out_err = err::ok;
+    return n->file.data;
+}
+
+// cd — resolve path and return new cwd (must be dir)
+inline node_t* cd(const char* path, node_t* cwd, err* out_err = nullptr) {
+    err e;
+    node_t* n = resolve(path, cwd, &e);
+    if (!n) { if (out_err) *out_err = e; return nullptr; }
+    if (n->kind != node_kind::dir) { if (out_err) *out_err = err::not_dir; return nullptr; }
+    if (out_err) *out_err = err::ok;
+    return n;
+}
+
+// pwd — write current path into buf (up to len chars)
+inline void pwd(node_t* cwd, char* buf, int len) {
+    if (cwd == root) { buf[0] = '/'; buf[1] = '\0'; return; }
+
+    // walk up to root collecting names, then reverse
+    const char* parts[32];
+    int nparts = 0;
+    node_t* cur = cwd;
+    while (cur != root && nparts < 32) {
+        parts[nparts++] = cur->name;
+        cur = cur->parent;
+    }
+
+    int pos = 0;
+    for (int i = nparts - 1; i >= 0 && pos < len - 2; --i) {
+        buf[pos++] = '/';
+        const char* p = parts[i];
+        while (*p && pos < len - 1) buf[pos++] = *p++;
+    }
+    buf[pos] = '\0';
+}
+
+// ls_node — return the directory node for ls (used by shell)
+inline node_t* get_root() { return root; }
+
+} // namespace vfs

@@ -1,0 +1,88 @@
+#include <stdint.h>
+#include <stddef.h>
+
+#include "../vendor/limine/limine.h"
+#include "cpu/gdt.eixx"
+#include "cpu/idt.eixx"
+#include "cpu/pic.eixx"
+#include "cpu/isr.eixx"
+#include "mm/pmm.eixx"
+#include "mm/cascade.eixx"
+#include "gfx/fb.eixx"
+#include "drv/driver.eixx"
+#include "drv/input/keyboard.eixx"
+#include "fs/vfs.eixx"
+#include "sys/shell.eixx"
+
+// ── limine requests ───────────────────────────────────────────────────────
+
+__attribute__((used, section(".limine_requests_start")))
+static volatile uint64_t requests_start[] = LIMINE_REQUESTS_START_MARKER;
+
+__attribute__((used, section(".limine_requests")))
+static volatile uint64_t base_rev[] = LIMINE_BASE_REVISION(3);
+
+__attribute__((used, section(".limine_requests")))
+static volatile struct limine_framebuffer_request fb_req = {
+    .id       = LIMINE_FRAMEBUFFER_REQUEST_ID,
+    .revision = 0,
+    .response = nullptr,
+};
+
+__attribute__((used, section(".limine_requests")))
+static volatile struct limine_memmap_request mmap_req = {
+    .id       = LIMINE_MEMMAP_REQUEST_ID,
+    .revision = 0,
+    .response = nullptr,
+};
+
+__attribute__((used, section(".limine_requests")))
+static volatile struct limine_hhdm_request hhdm_req = {
+    .id       = LIMINE_HHDM_REQUEST_ID,
+    .revision = 0,
+    .response = nullptr,
+};
+
+__attribute__((used, section(".limine_requests_end")))
+static volatile uint64_t requests_end[] = LIMINE_REQUESTS_END_MARKER;
+
+// ── entry point ───────────────────────────────────────────────────────────
+
+extern "C" [[noreturn]] void kmain() {
+    // ── cpu init ──────────────────────────────────────────────────────────
+    gdt::init();
+    idt::init();
+    isr::install();
+    pic::init();
+    pic::mask_all();
+
+    if (!fb_req.response   || fb_req.response->framebuffer_count < 1) goto halt;
+    if (!mmap_req.response)                                            goto halt;
+    if (!hhdm_req.response)                                            goto halt;
+
+    {
+        // ── memory ────────────────────────────────────────────────────────
+        uint64_t hhdm = hhdm_req.response->offset;
+        pmm::init(mmap_req.response, hhdm);
+        cascade::init(hhdm);
+
+        // ── framebuffer ───────────────────────────────────────────────────
+        limine_framebuffer* info = fb_req.response->framebuffers[0];
+        fb::init(reinterpret_cast<uint32_t*>(info->address),
+                 info->width, info->height, info->pitch);
+        fb::clear();
+
+        // ── driver manager ────────────────────────────────────────────────
+        drv::manager.init();
+        drv::manager.register_driver(&drv::keyboard); // probe + start keyboard
+
+        // ── vfs ───────────────────────────────────────────────────────────
+        vfs::init();
+
+        // ── shell ─────────────────────────────────────────────────────────
+        shell::run();
+    }
+
+halt:
+    for (;;) asm volatile("hlt");
+}

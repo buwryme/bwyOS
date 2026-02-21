@@ -1,0 +1,156 @@
+#pragma once
+
+#include <stdint.h>
+#include <stddef.h>
+
+#include "io.eixx"
+
+// ── drv::driver_t + drv::manager ─────────────────────────────────────────
+//
+// inspired by apple's iokit:
+//   - every driver is a driver_t subclass
+//   - drivers self-register with drv::manager on init
+//   - manager holds a flat registry of up to MAX_DRIVERS entries
+//   - drivers declare their name, kind, and lifecycle hooks (probe/start/stop)
+//   - io.eixx provides validated inb/outb so drivers never touch raw ports
+//
+// lifecycle:
+//   probe()  — detect hardware, return true if present
+//   start()  — initialise hardware, claim resources
+//   stop()   — release resources (called on shutdown)
+//
+// error handling:
+//   drivers store last_err and call set_err() when port ops fail.
+//   callers can check drv->ok() or drv->last_err after any call.
+
+namespace drv {
+
+// ── driver kind tags ──────────────────────────────────────────────────────
+
+enum class kind_t : uint8_t {
+    unknown    = 0,
+    keyboard   = 1,
+    mouse      = 2,
+    serial     = 3,
+    ata        = 4,
+    framebuffer= 5,
+    timer      = 6,
+    audio      = 7,
+};
+
+#pragma clang diagnostic ignored "-Wunused-function"
+static inline const char* kind_str(kind_t k) {
+    switch (k) {
+        case kind_t::keyboard:    return "keyboard";
+        case kind_t::mouse:       return "mouse";
+        case kind_t::serial:      return "serial";
+        case kind_t::ata:         return "ata";
+        case kind_t::framebuffer: return "framebuffer";
+        case kind_t::timer:       return "timer";
+        case kind_t::audio:       return "audio";
+        default:                  return "unknown";
+    }
+}
+
+// ── driver_t — base class every driver inherits ───────────────────────────
+
+struct driver_t {
+    const char*   name;        // human-readable e.g. "ps2-keyboard"
+    kind_t        kind;        // driver class tag
+    bool          started;     // true after start() succeeds
+    io::err       last_err;    // last error from a port op
+
+    // ── lifecycle — override in subclass ──────────────────────────────────
+    virtual bool probe() = 0;  // return true if hardware present
+    virtual bool start() = 0;  // init hardware; return true on success
+    virtual void stop()  {}    // release resources (optional)
+
+    // ── helpers available to all drivers ─────────────────────────────────
+
+    // validated port reads — sets last_err on failure
+    io::result_t read8(uint16_t port) {
+        auto r = io::inb(port);
+        last_err = r.error;
+        return r;
+    }
+
+    // validated port write — sets last_err on failure
+    bool write8(uint16_t port, uint8_t val) {
+        last_err = io::outb(port, val);
+        return last_err == io::err::ok;
+    }
+
+    // poll port until ready or timeout — sets last_err
+    bool wait_ready(uint16_t port, uint8_t mask, uint8_t expected,
+                    uint32_t limit = 100000) {
+        last_err = io::poll_ready(port, mask, expected, limit);
+        return last_err == io::err::ok;
+    }
+
+    bool ok() const { return last_err == io::err::ok; }
+
+protected:
+    // subclasses call this in constructors — sets name/kind, clears state
+    void init_base(const char* n, kind_t k) {
+        name     = n;
+        kind     = k;
+        started  = false;
+        last_err = io::err::ok;
+    }
+};
+
+// ── manager — flat driver registry ────────────────────────────────────────
+
+static constexpr int MAX_DRIVERS = 32;
+
+struct manager_t {
+    driver_t* drivers[MAX_DRIVERS];
+    int       count;
+
+    void init() { count = 0; }
+
+    // register + probe + start a driver.
+    // returns false if probe() fails (hardware not present) or start() fails.
+    bool register_driver(driver_t* d) {
+        if (count >= MAX_DRIVERS) return false;
+
+        if (!d->probe()) return false;   // hardware not found — silent skip
+
+        if (!d->start()) return false;   // init failed
+
+        d->started = true;
+        drivers[count++] = d;
+        return true;
+    }
+
+    // find first driver of given kind
+    driver_t* find(kind_t k) const {
+        for (int i = 0; i < count; ++i)
+            if (drivers[i]->kind == k) return drivers[i];
+        return nullptr;
+    }
+
+    // find driver by name
+    driver_t* find(const char* n) const {
+        for (int i = 0; i < count; ++i) {
+            const char* a = drivers[i]->name;
+            const char* b = n;
+            while (*a && *b && *a == *b) { ++a; ++b; }
+            if (*a == *b) return drivers[i];
+        }
+        return nullptr;
+    }
+
+    void stop_all() {
+        for (int i = count - 1; i >= 0; --i) {
+            drivers[i]->stop();
+            drivers[i]->started = false;
+        }
+    }
+};
+
+// global singleton — initialised in entry.eixx
+#pragma clang diagnostic ignored "-Wunused-variable"
+static manager_t manager;
+
+} // namespace drv

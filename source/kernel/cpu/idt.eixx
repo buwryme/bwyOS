@@ -1,0 +1,51 @@
+#pragma once
+#include <stdint.h>
+
+namespace idt {
+
+struct [[gnu::packed]] entry_t {
+    uint16_t offset_low;
+    uint16_t selector;
+    uint8_t  ist;
+    uint8_t  type_attr;
+    uint16_t offset_mid;
+    uint32_t offset_high;
+    uint32_t zero;
+};
+
+struct [[gnu::packed]] ptr_t {
+    uint16_t limit;
+    uint64_t base;
+};
+
+static entry_t table[256];
+static ptr_t   idtr;
+
+static inline void set_gate(uint8_t vec, uint64_t handler,
+                             uint8_t type_attr = 0x8e) {
+    table[vec].offset_low  = handler & 0xffff;
+    table[vec].offset_mid  = (handler >> 16) & 0xffff;
+    table[vec].offset_high = (handler >> 32) & 0xffffffff;
+    table[vec].selector    = 0x08; // kernel code segment
+    table[vec].ist         = 0;
+    table[vec].type_attr   = type_attr;
+    table[vec].zero        = 0;
+}
+
+// default handler — just iret, keeps cpu alive on spurious ints
+[[gnu::naked]] static void default_handler() {
+    asm volatile("iretq");
+}
+
+inline void init() {
+    // fill all vectors with a safe default before lidt
+    uint64_t h = (uint64_t)default_handler;
+    for (int i = 0; i < 256; ++i)
+        set_gate(i, h);
+
+    idtr.limit = sizeof(table) - 1;
+    idtr.base  = (uint64_t)&table;
+    asm volatile("lidt %0" :: "m"(idtr) : "memory");
+}
+
+} // namespace idt
