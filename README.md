@@ -1,0 +1,31 @@
+# simple x86_64 kernel
+
+a minimal, freestanding kernel for x86_64 architecture.
+
+## features
+
+* cascade (slab-based) memory management
+* IDT, ISR, GDT and PIC
+* driver management (IOKit-inspired) and universal driver interface
+* a VFS
+* simulated userland (shell)
+* limine-based framebuffer, and baked-in font
+* kernel panic
+
+## building
+
+requires a cross-compiler (e.g., this repo uses `clang++`) and `make`.
+
+```bash
+make
+```
+
+this will produce `build/bwyOS.iso`.
+
+## running
+
+```bash
+make run
+```
+
+runs the produced bwyOS.iso in qemu
