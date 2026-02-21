@@ -54,18 +54,67 @@ inline void clear(uint32_t color = BG) {
     }
 }
 
-inline void scroll() {
-    // move everything up by 12px (one line)
-    uint64_t line = 12;
-    for (uint64_t y = 0; y < height - line; ++y) {
-        uint32_t* dst = (uint32_t*)((uint8_t*)pixels + y * pitch);
-        uint32_t* src = (uint32_t*)((uint8_t*)pixels + (y + line) * pitch);
-        for (uint64_t x = 0; x < width; ++x)
-            dst[x] = src[x];
+inline void* fb_memmove(void* dst, const void* src, uint64_t n) {
+    uint8_t* d = (uint8_t*)dst;
+    const uint8_t* s = (const uint8_t*)src;
+
+    if (d == s || n == 0)
+        return dst;
+
+    if (d < s) {
+        // forward copy
+        while (n >= 8) {
+            *(uint64_t*)d = *(const uint64_t*)s;
+            d += 8;
+            s += 8;
+            n -= 8;
+        }
+        while (n--) {
+            *d++ = *s++;
+        }
+    } else {
+        // backward copy (overlap safe)
+        d += n;
+        s += n;
+
+        while (n >= 8) {
+            d -= 8;
+            s -= 8;
+            *(uint64_t*)d = *(const uint64_t*)s;
+            n -= 8;
+        }
+        while (n--) {
+            *--d = *--s;
+        }
     }
-    // clear bottom line
-    for (uint64_t y = height - line; y < height; ++y) {
-        uint32_t* row = (uint32_t*)((uint8_t*)pixels + y * pitch);
+
+    return dst;
+}
+
+inline void scroll() {
+    const uint64_t line_px = 12;
+    const uint64_t bytes_per_line = pitch;
+
+    uint8_t* base = (uint8_t*)pixels;
+
+    const uint64_t move_bytes =
+        (height - line_px) * bytes_per_line;
+
+    // move framebuffer memory upward
+    fb_memmove(
+        base,
+        base + line_px * bytes_per_line,
+        move_bytes
+    );
+
+    // clear bottom region
+    uint8_t* bottom =
+        base + (height - line_px) * bytes_per_line;
+
+    for (uint64_t y = 0; y < line_px; ++y) {
+        uint32_t* row =
+            (uint32_t*)(bottom + y * bytes_per_line);
+
         for (uint64_t x = 0; x < width; ++x)
             row[x] = BG;
     }
