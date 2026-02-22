@@ -1,0 +1,39 @@
+#pragma once
+#include <stdint.h>
+#include "regs.eixx"
+
+namespace pit {
+
+static constexpr uint16_t PORT_CH0  = 0x40;
+static constexpr uint16_t PORT_CMD  = 0x43;
+static constexpr uint32_t BASE_FREQ = 1193182;
+
+static volatile uint64_t ticks = 0;
+
+static void irq0_handler(panic::regs_t*) {
+    ticks = ticks + 1;
+}
+
+inline void init(uint32_t freq_hz) {
+    uint32_t divisor = BASE_FREQ / freq_hz;
+
+    // Send command byte: Channel 0, lobyte/hibyte, Mode 3 (square wave), binary
+    pic::outb(PORT_CMD, 0x36);
+    pic::outb(PORT_CH0, (uint8_t)(divisor & 0xFF));
+    pic::outb(PORT_CH0, (uint8_t)((divisor >> 8) & 0xFF));
+
+    isr::register_irq(32, irq0_handler);
+    pic::unmask(0); // Unmask IRQ0
+}
+
+inline uint64_t get_ticks() { return ticks; }
+
+// Assuming freq_hz = 1000 in init()
+inline void sleep_ms(uint64_t ms) {
+    uint64_t start = ticks;
+    while (ticks < start + ms) {
+        asm volatile("pause");
+    }
+}
+
+} // namespace pit

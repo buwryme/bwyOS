@@ -1,0 +1,18 @@
+#pragma once
+#include <stdint.h>
+
+namespace panic {
+
+struct regs_t {
+    uint64_t rax, rbx, rcx, rdx;
+    uint64_t rsi, rdi, rbp, rsp;
+    uint64_t r8,  r9,  r10, r11;
+    uint64_t r12, r13, r14, r15;
+    uint64_t vec; // exception vector
+    uint64_t err; // error code (0 if none)
+    uint64_t rip; // from iret frame
+    uint64_t cs;
+    uint64_t rflags;
+};
+
+} // namespace panic

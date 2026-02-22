@@ -2,14 +2,17 @@
 
 #include <stdint.h>
 
-#include "../gfx/fb.eixx"
-#include "../gfx/kprint.eixx"
-#include "../drv/driver.eixx"
-#include "../drv/input/keyboard.eixx"
-#include "../sys/panic.eixx"
-#include "../mm/cascade.eixx"
-#include "../fs/vfs.eixx"
-#include "../cpu/cpuid.eixx"
+#include "../../gfx/fb.eixx"
+#include "../../gfx/kprint.eixx"
+#include "../../drv/driver.eixx"
+#include "../../drv/input/keyboard.eixx"
+#include "../../drv/input/mouse.eixx"
+#include "../../sys/panic.eixx"
+#include "../../mm/cascade.eixx"
+#include "../../fs/vfs.eixx"
+#include "../../cpu/cpuid.eixx"
+#include "char_animations.eixx"
+#include "newline_animations.eixx"
 
 namespace shell {
 
@@ -58,18 +61,102 @@ static inline void sncopy(char* dst, const char* src, int n) {
     dst[i] = '\0';
 }
 
+static inline int min(int a, int b) { return a < b ? a : b; }
+
+static inline int levenshtein(const char* s1, const char* s2) {
+    int len1 = slen(s1);
+    int len2 = slen(s2);
+    int matrix[32][32]; // assume max command length 31
+
+    if (len1 > 31) len1 = 31;
+    if (len2 > 31) len2 = 31;
+
+    for (int i = 0; i <= len1; i++) matrix[i][0] = i;
+    for (int j = 0; j <= len2; j++) matrix[0][j] = j;
+
+    for (int i = 1; i <= len1; i++) {
+        for (int j = 1; j <= len2; j++) {
+            int cost = (s1[i - 1] == s2[j - 1]) ? 0 : 1;
+            matrix[i][j] = min(min(matrix[i - 1][j] + 1, matrix[i][j - 1] + 1), matrix[i - 1][j - 1] + cost);
+        }
+    }
+    return matrix[len1][len2];
+}
+
+static const char* known_commands[] = {
+    "help", "ls", "cat", "mkdir", "touch", "cd", "pwd", "rm", "echo",
+    "uname", "whoami", "date", "fetch", "clear", "drivers", "res",
+    "meminfo", "memtest", "memstress", "meminspect", "panic", "fault", "cpuid", "memmap"
+};
+static constexpr int num_known_commands = sizeof(known_commands) / sizeof(char*);
+
 // ── session state ─────────────────────────────────────────────────────────
 
 static vfs::node_t* cwd = nullptr; // initialised in run()
 
-// ── prompt helper ─────────────────────────────────────────────────────────
+// ── redirection state ─────────────────────────────────────────────────────
+static char   redir_buf[vfs::FILE_MAX_SIZE];
+static int    redir_pos  = 0;
+static bool   redir_active = false;
+
+// called by the redirection-aware print wrapper below
+static void redir_write(const char* s) {
+    while (*s && redir_pos < vfs::FILE_MAX_SIZE - 1)
+        redir_buf[redir_pos++] = *s++;
+    redir_buf[redir_pos] = '\0';
+}
+
+static void update_mice() {
+    for (int i = 0; i < drv::mouse_count; i++) {
+        drv::mouse_t* m = drv::mice[i];
+        m->update();
+        fb::sync_mouse(i, m->state.x, m->state.y, true);
+    }
+}
+
+static void wait_anim() {
+    while (anim::is_busy()) {
+        update_mice();
+        anim::tick();
+        pit::sleep_ms(1);
+    }
+}
+
+// animated print wrapper: uses character appearance animations
+static void pr_anim(const char* s, uint32_t color = fb::FG) {
+    if (redir_active) {
+        redir_write(s);
+    } else {
+        while (*s) {
+            if (*s == '\n') {
+                wait_anim(); // ensure line is clear before scroll
+                anim::animate_newline();
+            } else {
+                anim::animate_appear(fb::cur_x, fb::cur_y, *s, color);
+                fb::cur_x += 8;
+                if (fb::cur_x + 8 > fb::width) {
+                    wait_anim();
+                    anim::animate_newline();
+                }
+            }
+            
+            // tiny stagger for "one by one" feel without the full wait
+            for (int i = 0; i < 2; i++) {
+                update_mice();
+                anim::tick();
+                pit::sleep_ms(1);
+            }
+            s++;
+        }
+    }
+}
 
 static void print_prompt() {
     char path[vfs::PATH_MAX];
     vfs::pwd(cwd, path, vfs::PATH_MAX);
-    fb::print("root@bwyos:", fb::PROMPT);
-    fb::print(path,          fb::YELLOW);
-    fb::print("# ",          fb::PROMPT);
+    pr_anim("root@bwyos:", fb::PROMPT);
+    pr_anim(path,          fb::YELLOW);
+    pr_anim("# ",          fb::PROMPT);
 }
 
 // ── redirection parser ────────────────────────────────────────────────────
@@ -110,25 +197,13 @@ static bool parse_redirect(char* buf, char** out_file, bool* out_append) {
     return false;
 }
 
-// ── output capture for redirection ───────────────────────────────────────
-// when redirecting, we swap fb::print to write into a buffer instead.
-// simple approach: capture buffer + flag, fb::print checks it.
+// ── redirection parser ────────────────────────────────────────────────────
 
-static char   redir_buf[vfs::FILE_MAX_SIZE];
-static int    redir_pos  = 0;
-static bool   redir_active = false;
-
-// called by the redirection-aware print wrapper below
-static void redir_write(const char* s) {
-    while (*s && redir_pos < vfs::FILE_MAX_SIZE - 1)
-        redir_buf[redir_pos++] = *s++;
-    redir_buf[redir_pos] = '\0';
-}
 
 // print wrapper: routes to redir_buf when active, else to fb
 static void pr(const char* s, uint32_t color = fb::FG) {
     if (redir_active) redir_write(s);
-    else              fb::print(s, color);
+    else              pr_anim(s, color);
 }
 
 // ── built-in commands ─────────────────────────────────────────────────────
@@ -137,7 +212,7 @@ static void cmd_help() {
     pr("commands: help  ls [path]  cat <file>  mkdir <dir>  touch <file>\n");
     pr("          cd <dir>  pwd  rm <file>  echo <text> [> file]\n");
     pr("          uname  whoami  date  fetch  clear  res\n");
-    pr("          meminfo  memtest  memstress  meminspect\n");
+    pr("          meminfo  memtest  memstress  meminspect  memmap\n");
     pr("          drivers\n");
     pr("          panic [msg|vec#]  fault <ud|div|gpf|pf>\n");
 }
@@ -315,12 +390,26 @@ static void cmd_whoami() { pr("root\n"); }
 static void cmd_date()   { pr("sat feb 21 00:00:00 utc 2026\n"); }
 
 static void cmd_fetch() {
-    fb::print("   *   ",  fb::PURPLE); fb::print("os:     ", fb::GRAY); fb::print("bwyos 0.3.0\n",          fb::FG);
+    // a helper to help print used_mem gb / all_mem gb
+    auto pr_mem = []() {
+        auto s = cascade::get_stats();
+        uint64_t ps = pmm::page_size;
+        uint64_t u_bytes = s.used_phys_pages * ps;
+        uint64_t t_bytes = s.total_phys_pages * ps;
+
+        auto p = [](uint64_t b) {
+            kprint::u64(b >> 30, fb::FG);
+            pr("gi", fb::GRAY);
+        };
+        p(u_bytes); pr(" / ", fb::GRAY); p(t_bytes);
+    };
+
+    fb::print("   *   ",  fb::PURPLE);  fb::print("os:     ", fb::GRAY); fb::print("bwyos 0.3.0\n",          fb::FG);
     fb::print("  / \\  ",  fb::PURPLE); fb::print("krnl:   ", fb::GRAY); fb::print("bwy.kernel\n",           fb::FG);
-    fb::print(" *---* ",  fb::PURPLE); fb::print("alloc:  ", fb::GRAY); fb::print("cascade + pmm\n",         fb::FG);
+    fb::print(" *---* ",  fb::PURPLE);  fb::print("mem:    ", fb::GRAY); pr_mem(); pr("\n");
     fb::print("  \\ /  ",  fb::PURPLE); fb::print("vfs:    ", fb::GRAY); fb::print("bwy.vfs (in-memory)\n",  fb::FG);
-    fb::print("   *   ",  fb::PURPLE); fb::print("drv:    ", fb::GRAY); fb::print("bwy.iokit\n",             fb::FG);
-    fb::print("       ",  fb::PURPLE); fb::print("sh:     ", fb::GRAY); fb::print("bwy.sh\n\n",              fb::FG);
+    fb::print("   *   ",  fb::PURPLE);  fb::print("drv:    ", fb::GRAY); fb::print("bwy.iokit\n",            fb::FG);
+    fb::print("       ",  fb::PURPLE);  fb::print("sh:     ", fb::GRAY); fb::print("bwy.sh\n\n",             fb::FG);
 }
 
 static void cmd_clear() { fb::clear(); fb::cur_x = fb::cur_y = 0; }
@@ -398,6 +487,35 @@ static void cmd_meminspect() {
         if (p) { kprint::hex(reinterpret_cast<uint64_t>(p)); kprint::nl(); }
         else   { fb::print("null\n", fb::RED); }
         kfree(p);
+    }
+}
+
+static void cmd_memmap() {
+    if (!pmm::mmap_resp) {
+        pr("memmap: response not available\n", fb::RED);
+        return;
+    }
+    pr("── limine memory map ──────────────────\n", fb::YELLOW);
+    for (uint64_t i = 0; i < pmm::mmap_resp->entry_count; ++i) {
+        auto* e = pmm::mmap_resp->entries[i];
+        kprint::str("  ["); kprint::u64(i); kprint::str("] ");
+        kprint::hex(e->base); kprint::str(" - ");
+        kprint::hex(e->base + e->length); kprint::str("  ");
+        
+        const char* type_str = "unknown";
+        uint32_t color = fb::FG;
+        switch (e->type) {
+            case LIMINE_MEMMAP_USABLE:                 type_str = "usable";                 color = fb::GREEN;  break;
+            case LIMINE_MEMMAP_RESERVED:               type_str = "reserved";               color = fb::GRAY;   break;
+            case LIMINE_MEMMAP_ACPI_RECLAIMABLE:       type_str = "acpi reclaimable";      color = fb::PURPLE; break;
+            case LIMINE_MEMMAP_ACPI_NVS:               type_str = "acpi nvs";              color = fb::PURPLE; break;
+            case LIMINE_MEMMAP_BAD_MEMORY:             type_str = "bad memory";             color = fb::RED;    break;
+            case LIMINE_MEMMAP_BOOTLOADER_RECLAIMABLE: type_str = "bootloader reclaimable"; color = fb::YELLOW; break;
+            case LIMINE_MEMMAP_EXECUTABLE_AND_MODULES: type_str = "kernel/modules";        color = fb::PURPLE; break;
+            case LIMINE_MEMMAP_FRAMEBUFFER:            type_str = "framebuffer";           color = fb::PURPLE; break;
+        }
+        fb::print(type_str, color);
+        pr("\n");
     }
 }
 
@@ -494,8 +612,8 @@ static void cmd_cpuid() {
         fb::print(f.name, fb::GREEN);
         any = true;
     }
-    if (!any) fb::print("none", fb::GRAY);
-    fb::print("\n", fb::FG);
+    if (!any) pr("none", fb::GRAY);
+    pr("\n", fb::FG);
 }
 
 // ── secret ────────────────────────────────────────────────────────────────
@@ -504,16 +622,18 @@ static void cmd_cpuid() {
     panic::kpanic(msg);
 }
 
+
 // ── run ───────────────────────────────────────────────────────────────────
 inline void run() {
     cwd = vfs::get_root();
+    anim::init();
 
     static char buf[256];
     uint32_t pos = 0;
 
-    fb::print("bwy.kernel v0.3.0 (bwy.sh)\n", fb::GREEN);
-    fb::print("vfs + iokit ready\n",           fb::PURPLE);
-    fb::print("type 'help' for commands.\n\n");
+    pr_anim("bwy.kernel v0.3.0 (bwy.sh)\n", fb::GREEN);
+    pr_anim("vfs + iokit ready\n",           fb::PURPLE);
+    pr_anim("type 'help' for commands.\n\n");
 
     // get keyboard from driver manager
     drv::keyboard_t* kbd = reinterpret_cast<drv::keyboard_t*>(
@@ -524,16 +644,43 @@ inline void run() {
         pos = 0;
 
         while (true) {
-            char c = kbd ? kbd->get_key() : '\0';
+            update_mice();
+            anim::tick();
+
+            char c = kbd ? kbd->poll_key() : '\0';
+            if (c == '\0') {
+                asm volatile("pause");
+                continue;
+            }
+
             if (c == '\n') {
-                buf[pos] = '\0'; fb::print("\n"); break;
+                buf[pos] = '\0';
+                anim::animate_newline(); 
+                break;
             } else if (c == '\b') {
-                if (pos > 0) { --pos; fb::backspace(); }
+                if (pos > 0) {
+                    --pos;
+                    char to_remove = buf[pos];
+                    
+                    // handle cursor position for backspace
+                    if (fb::cur_x >= 8) {
+                        fb::cur_x -= 8;
+                    } else if (fb::cur_y >= 12) {
+                        fb::cur_y -= 12;
+                        fb::cur_x = (fb::width / 8) * 8 - 8;
+                    }
+                    wait_anim();
+                    anim::animate_remove(fb::cur_x, fb::cur_y, to_remove, fb::FG);
+                }
             } else if (pos < 255 && c >= 32) {
                 buf[pos++] = c;
-                fb::draw_char(fb::cur_x, fb::cur_y, c, fb::FG);
+                wait_anim();
+                anim::animate_appear(fb::cur_x, fb::cur_y, c, fb::FG);
                 fb::cur_x += 8;
-                if (fb::cur_x + 8 > fb::width) fb::newline();
+                if (fb::cur_x + 8 > fb::width) {
+                    wait_anim();
+                    anim::animate_newline();
+                }
             }
         }
 
@@ -575,14 +722,31 @@ inline void run() {
         else if (streq(buf, "memtest"))       cmd_memtest();
         else if (streq(buf, "memstress"))     cmd_memstress();
         else if (streq(buf, "meminspect"))    cmd_meminspect();
+        else if (streq(buf, "memmap"))        cmd_memmap();
         else if (streq(buf, "67"))            cmd_67();
         else if ((arg = const_cast<char*>(match(buf, "panic")))   != nullptr) cmd_panic(arg);
         else if (streq(buf, "panic"))         cmd_panic(nullptr);
         else if ((arg = const_cast<char*>(match(buf, "fault")))   != nullptr) cmd_fault(arg);
         else if ((arg = const_cast<char*>(match(buf, "cpuid")))   != nullptr) cmd_cpuid();
         else {
-            fb::print("bwy.sh: not found: ", fb::RED);
-            fb::print(buf, fb::RED); fb::print("\n");
+            pr("bwy.sh: not found: ", fb::RED);
+            pr(buf, fb::RED); pr("\n");
+
+            // fuzzy matching
+            const char* best_match = nullptr;
+            int best_dist = 999;
+            for (int i = 0; i < num_known_commands; ++i) {
+                int d = levenshtein(buf, known_commands[i]);
+                if (d < best_dist) {
+                    best_dist = d;
+                    best_match = known_commands[i];
+                }
+            }
+            if (best_match && best_dist <= 2) {
+                pr("did you mean: ", fb::YELLOW);
+                pr(best_match, fb::YELLOW);
+                pr("?\n", fb::YELLOW);
+            }
         }
 
         // ── flush redirection buffer to vfs ──────────────────────────────

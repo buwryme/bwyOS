@@ -1,7 +1,13 @@
 #pragma once
 #include <stdint.h>
-#include "../sys/panic.eixx"
 #include "idt.eixx"
+#include "pic.eixx"
+#include "regs.eixx"
+
+namespace panic { 
+    [[noreturn]] void kpanic(const char* msg);
+    [[noreturn]] void kpanic_exception(const char* msg, uint64_t vec, regs_t* regs);
+}
 
 // ── exception stub machinery ──────────────────────────────────────────────
 //
@@ -110,16 +116,59 @@ ISR_NOERR(19)  // #xm  simd floating-point
 ISR_NOERR(20)  //      reserved
 ISR_ERR  (21)  // #cp  control protection
 
+// common IRQ handler — receives regs_t*, sends EOI
+static void irq_handler(panic::regs_t* r);
+
+[[gnu::naked]] static void common_irq_stub() {
+    asm volatile(
+        "push %%r15; push %%r14; push %%r13; push %%r12; push %%r11; push %%r10; push %%r9; push %%r8; push %%rsp; push %%rbp; push %%rdi; push %%rsi; push %%rdx; push %%rcx; push %%rbx; push %%rax\n\t"
+        "mov %%rsp, %%rdi\n\t"
+        "call %P0\n\t"
+        "pop %%rax; pop %%rbx; pop %%rcx; pop %%rdx; pop %%rsi; pop %%rdi; pop %%rbp; pop %%rsp; pop %%r8; pop %%r9; pop %%r10; pop %%r11; pop %%r12; pop %%r13; pop %%r14; pop %%r15\n\t"
+        "add $16, %%rsp\n\t" // clean up vec + err
+        "iretq\n\t"
+        : : "i"(irq_handler) : "memory"
+    );
+}
+
+#define ISR_IRQ(vec)                                \
+    [[gnu::naked]] static void isr##vec() {         \
+        asm volatile(                               \
+            "push $0\n\t"                           \
+            "push $" #vec "\n\t"                    \
+            "jmp %P0\n\t"                           \
+            : : "i"(common_irq_stub)                \
+        );                                          \
+    }
+
 #undef ISR_NOERR
 #undef ISR_ERR
+
+ISR_IRQ(32) // PIT
+ISR_IRQ(33) // Keyboard
+ISR_IRQ(44) // Mouse
+
+static void (*irq_callbacks[256])(panic::regs_t*) = { nullptr };
+
+static void irq_handler(panic::regs_t* r) {
+    if (irq_callbacks[r->vec]) {
+        irq_callbacks[r->vec](r);
+    }
+
+    // send EOI
+    if (r->vec >= 0x28) pic::outb(0xA0, 0x20); // slave
+    pic::outb(0x20, 0x20); // master
+}
+
+inline void register_irq(uint8_t vec, void (*fn)(panic::regs_t*)) {
+    irq_callbacks[vec] = fn;
+}
+
+#undef ISR_IRQ
 
 // ── install into the idt ──────────────────────────────────────────────────
 // call this from idt::init() or right after it
 inline void install() {
-    // we need to call idt::set_gate — include it from wherever it's visible.
-    // since all .eixx files are included into a single tu via entry.eixx,
-    // idt:: is already in scope.
-
     auto install_one = [](uint8_t vec, uint64_t fn) {
         idt::set_gate(vec, fn);
     };
@@ -146,6 +195,10 @@ inline void install() {
     install_one(19, reinterpret_cast<uint64_t>(isr19));
     install_one(20, reinterpret_cast<uint64_t>(isr20));
     install_one(21, reinterpret_cast<uint64_t>(isr21));
+
+    install_one(32, reinterpret_cast<uint64_t>(isr32));
+    install_one(33, reinterpret_cast<uint64_t>(isr33));
+    install_one(44, reinterpret_cast<uint64_t>(isr44));
 }
 
 } // namespace isr

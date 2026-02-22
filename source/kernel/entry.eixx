@@ -6,13 +6,16 @@
 #include "cpu/idt.eixx"
 #include "cpu/pic.eixx"
 #include "cpu/isr.eixx"
+#include "cpu/pit.eixx"
 #include "mm/pmm.eixx"
 #include "mm/cascade.eixx"
 #include "gfx/fb.eixx"
 #include "drv/driver.eixx"
 #include "drv/input/keyboard.eixx"
+#include "drv/input/mouse.eixx"
+#include "drv/input/ps2/mouse.eixx"
 #include "fs/vfs.eixx"
-#include "sys/shell.eixx"
+#include "sys/shell/shell.eixx"
 
 // ── limine requests ───────────────────────────────────────────────────────
 
@@ -55,6 +58,8 @@ extern "C" [[noreturn]] void kmain() {
     isr::install();
     pic::init();
     pic::mask_all();
+    pit::init(1000);
+    asm volatile("sti");
 
     if (!fb_req.response   || fb_req.response->framebuffer_count < 1) goto halt;
     if (!mmap_req.response)                                            goto halt;
@@ -75,6 +80,10 @@ extern "C" [[noreturn]] void kmain() {
         // ── driver manager ────────────────────────────────────────────────
         drv::manager.init();
         drv::manager.register_driver(&drv::keyboard); // probe + start keyboard
+        drv::manager.register_driver(&drv::ps2_mouse);
+
+        // link them to the mouse list
+        drv::register_mouse(&drv::ps2_mouse);
 
         // ── vfs ───────────────────────────────────────────────────────────
         vfs::init();

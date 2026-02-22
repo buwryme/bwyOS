@@ -1,0 +1,38 @@
+#pragma once
+
+#include <stdint.h>
+#include "../driver.eixx"
+
+namespace drv {
+
+struct mouse_state_t {
+    int32_t x;
+    int32_t y;
+    bool left;
+    bool right;
+    bool middle;
+};
+
+struct mouse_t : driver_t {
+    mouse_state_t state;
+
+    void init_mouse(const char* name) {
+        init_base(name, kind_t::mouse);
+        state = {0, 0, false, false, false};
+    }
+
+    virtual void update() = 0;
+};
+
+// A list of all active mice
+static constexpr int MAX_MICE = 8;
+static mouse_t* mice[MAX_MICE];
+static int mouse_count = 0;
+
+inline void register_mouse(mouse_t* m) {
+    if (mouse_count < MAX_MICE) {
+        mice[mouse_count++] = m;
+    }
+}
+
+} // namespace drv

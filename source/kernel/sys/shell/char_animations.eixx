@@ -1,0 +1,109 @@
+#pragma once
+
+#include "../../gfx/fb.eixx"
+#include "../../cpu/pit.eixx"
+
+namespace shell {
+namespace anim {
+
+struct frame_t {
+    int     offset_y;
+    uint8_t opacity;
+};
+
+// 6 frames bouncy overshoot animation - snappier!
+static constexpr frame_t appear[] = {
+    { 10, 80  }, { 4,  160 }, { -2, 220 }, { 1,  255 }, { 0,  255 }, { 0,  255 }
+};
+
+static constexpr frame_t remove[] = {
+    { 0,  200 }, { 2,  120 }, { 6,  40  }, { 10, 0   }
+};
+
+static constexpr int num_frames_appear = sizeof(appear) / sizeof(frame_t);
+static constexpr int num_frames_remove = sizeof(remove) / sizeof(frame_t);
+
+// Standardized timing per frame
+static constexpr uint64_t frame_delay_ms = 4; 
+
+// Animation Task system for non-blocking rendering
+struct task_t {
+    uint64_t x, y;
+    char     c;
+    uint32_t color;
+    int      frame;
+    bool     is_remove;
+    bool     active;
+    uint64_t next_tick;
+};
+
+static constexpr int MAX_TASKS = 512;
+static task_t tasks[MAX_TASKS];
+
+inline void init() {
+    for (int i = 0; i < MAX_TASKS; i++) tasks[i].active = false;
+}
+
+inline void animate_appear(uint64_t x, uint64_t y, char c, uint32_t color) {
+    for (int i = 0; i < MAX_TASKS; i++) {
+        if (!tasks[i].active) {
+            tasks[i] = {x, y, c, color, 0, false, true, pit::get_ticks()};
+            return;
+        }
+    }
+}
+
+inline void animate_remove(uint64_t x, uint64_t y, char c, uint32_t color) {
+    for (int i = 0; i < MAX_TASKS; i++) {
+        if (!tasks[i].active) {
+            tasks[i] = {x, y, c, color, 0, true, true, pit::get_ticks()};
+            return;
+        }
+    }
+}
+
+inline void tick() {
+    uint64_t now = pit::get_ticks();
+    bool any = false;
+    for (int i = 0; i < MAX_TASKS; i++) if (tasks[i].active) { any = true; break; }
+
+    if (!any) return;
+
+    fb::erase_mice();
+    for (int i = 0; i < MAX_TASKS; i++) {
+        if (!tasks[i].active) continue;
+        if (now < tasks[i].next_tick) continue;
+
+        int f = tasks[i].frame;
+        int max_f = tasks[i].is_remove ? num_frames_remove : num_frames_appear;
+        const frame_t* frames = tasks[i].is_remove ? remove : appear;
+
+        fb::draw_char_alpha(tasks[i].x, tasks[i].y + frames[f].offset_y, tasks[i].y, 
+                            tasks[i].c, tasks[i].color, fb::BG, frames[f].opacity);
+
+        tasks[i].frame++;
+        tasks[i].next_tick = now + frame_delay_ms;
+
+        if (tasks[i].frame >= max_f) {
+            if (tasks[i].is_remove) {
+                fb::erase_cell(tasks[i].x, tasks[i].y);
+            } else {
+                // Final perfect draw to ensure no artifacts
+                // NOTE: we MUST clear the cell first to remove the alpha-blended lerp residuals
+                fb::erase_cell(tasks[i].x, tasks[i].y);
+                fb::draw_char(tasks[i].x, tasks[i].y, tasks[i].c, tasks[i].color);
+            }
+            tasks[i].active = false;
+        }
+    }
+    fb::draw_mice();
+}
+
+inline bool is_busy() {
+    for (int i = 0; i < MAX_TASKS; i++)
+        if (tasks[i].active) return true;
+    return false;
+}
+
+} // namespace anim
+} // namespace shell

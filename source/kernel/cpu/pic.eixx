@@ -42,4 +42,17 @@ inline void mask_all() {
     outb(PIC2_DATA, 0xff);
 }
 
+inline void unmask(uint8_t irq) {
+    uint16_t port;
+    if (irq < 8) {
+        port = PIC1_DATA;
+    } else {
+        port = PIC2_DATA;
+        irq -= 8;
+    }
+    uint8_t value;
+    asm volatile("inb %1,%0" : "=a"(value) : "Nd"(port));
+    outb(port, value & ~(1 << irq));
+}
+
 } // namespace pic

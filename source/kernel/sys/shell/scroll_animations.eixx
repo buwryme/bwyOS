@@ -1,0 +1,17 @@
+#pragma once
+
+#include "../../gfx/fb.eixx"
+#include "../../cpu/pit.eixx"
+
+namespace shell {
+namespace anim {
+
+// Configurable scroll speed for the terminal
+// This defines how many ms it waits between each pixel row displacement
+static constexpr uint64_t scroll_row_delay_ms = 2; 
+
+// Newline specific timing
+static constexpr uint64_t newline_scroll_step_ms = 5; 
+
+} // namespace anim
+} // namespace shell

@@ -1,0 +1,56 @@
+#pragma once
+
+#include "../../gfx/fb.eixx"
+#include "../../cpu/pit.eixx"
+#include "scroll_animations.eixx"
+
+namespace shell {
+namespace anim {
+
+struct nl_frame_t {
+    int slide_offset; 
+};
+
+// Use the new config values
+static constexpr uint64_t typing_delay_ms = 1; 
+
+// Extensible scroll curve for newlines
+static constexpr nl_frame_t nl_scroll[] = {
+    { 6 }, { 5 }, { 9 }, { 12 }
+};
+
+static constexpr int num_nl_frames = sizeof(nl_scroll) / sizeof(nl_frame_t);
+
+inline void animate_newline() {
+    fb::cur_x = 0;
+    if (fb::cur_y + 24 > fb::height) {
+        const uint64_t bytes_per_line = fb::pitch;
+        uint8_t* base = (uint8_t*)fb::pixels;
+
+        fb::erase_mice();
+        int last_offset = 0;
+        for (int i = 0; i < num_nl_frames; i++) {
+            int target = nl_scroll[i].slide_offset;
+            int delta = target - last_offset;
+            
+            for (int d = 0; d < delta; d++) {
+                 fb::fb_memmove(
+                    base,
+                    base + bytes_per_line,
+                    (fb::height - 1) * bytes_per_line
+                );
+                uint32_t* last_row = (uint32_t*)(base + (fb::height - 1) * bytes_per_line);
+                for (uint64_t x = 0; x < fb::width; ++x) last_row[x] = fb::BG;
+            }
+            
+            last_offset = target;
+            pit::sleep_ms(newline_scroll_step_ms);
+        }
+        fb::draw_mice();
+    } else {
+        fb::cur_y += 12;
+    }
+}
+
+} // namespace anim
+} // namespace shell

@@ -1,6 +1,9 @@
 #pragma once
 #include <stdint.h>
 #include "font.eixx"
+#include "cpu/regs.eixx"
+
+namespace pit { void sleep_ms(uint64_t ms); }
 
 namespace fb {
 
@@ -33,16 +36,99 @@ inline void init(uint32_t* addr, uint64_t w, uint64_t h, uint64_t p) {
 }
 
 inline void put_pixel(uint64_t x, uint64_t y, uint32_t color) {
+    if (x >= width || y >= height) return;
     *((uint32_t*)((uint8_t*)pixels + y * pitch) + x) = color;
 }
 
+static uint32_t m_x[4], m_y[4];
+static uint32_t m_buf[4][64];
+static bool m_active[4]    = {false, false, false, false};
+static bool m_on_screen[4] = {false, false, false, false};
+
+inline uint32_t get_pixel(uint64_t x, uint64_t y) {
+    if (x >= width || y >= height) return BG;
+    return *((uint32_t*)((uint8_t*)pixels + y * pitch) + x);
+}
+
+inline void erase_mice() {
+    for (int i = 0; i < 4; i++) {
+        if (!m_on_screen[i]) continue;
+        for (uint64_t sy = 0; sy < 8; sy++) {
+            for (uint64_t sx = 0; sx < 8; sx++) {
+                put_pixel(m_x[i] + sx, m_y[i] + sy, m_buf[i][sy * 8 + sx]);
+            }
+        }
+        m_on_screen[i] = false;
+    }
+}
+
+inline void draw_mice() {
+    for (int i = 0; i < 4; i++) {
+        if (!m_active[i] || m_on_screen[i]) continue;
+        for (uint64_t sy = 0; sy < 8; sy++) {
+            for (uint64_t sx = 0; sx < 8; sx++) {
+                m_buf[i][sy * 8 + sx] = get_pixel(m_x[i] + sx, m_y[i] + sy);
+                put_pixel(m_x[i] + sx, m_y[i] + sy, PURPLE);
+            }
+        }
+        m_on_screen[i] = true;
+    }
+}
+
+inline void sync_mouse(int id, int x, int y, bool active) {
+    if (id < 0 || id >= 4) return;
+    erase_mice();
+    m_x[id] = x; m_y[id] = y; m_active[id] = active;
+    draw_mice();
+}
+
+static inline uint32_t lerp_color(uint32_t c1, uint32_t c2, uint8_t alpha) {
+    uint32_t r1 = (c1 >> 16) & 0xff, g1 = (c1 >> 8) & 0xff, b1 = c1 & 0xff;
+    uint32_t r2 = (c2 >> 16) & 0xff, g2 = (c2 >> 8) & 0xff, b2 = c2 & 0xff;
+
+    uint32_t r = (r1 * alpha + r2 * (255 - alpha)) / 255;
+    uint32_t g = (g1 * alpha + g2 * (255 - alpha)) / 255;
+    uint32_t b = (b1 * alpha + b2 * (255 - alpha)) / 255;
+
+    return (r << 16) | (g << 8) | b;
+}
+
 inline void draw_char(uint64_t x0, uint64_t y0, char c, uint32_t color) {
+    erase_mice();
     font::glyph_t g = font::get_glyph(c);
     for (uint64_t y = 0; y < 8; ++y) {
         uint8_t row = g.rows[y];
         for (uint64_t x = 0; x < 8; ++x)
             if (row & (0x80u >> x))
                 put_pixel(x0+x, y0+y, color);
+    }
+    draw_mice();
+}
+
+inline void draw_char_alpha(uint64_t x0, uint64_t y0, uint64_t cell_y, char c, uint32_t fg, uint32_t bg, uint8_t alpha) {
+    font::glyph_t g = font::get_glyph(c);
+    uint32_t color = lerp_color(fg, bg, alpha);
+    
+    // STRICT CLIPPING: only clear and draw within the [cell_y, cell_y + 12] range.
+    // This prevents "stains" on the lines above and below.
+    for (uint64_t y = 0; y < 12; ++y) {
+        uint64_t abs_y = cell_y + y;
+        if (abs_y < height) {
+            for (uint64_t x = 0; x < 8; ++x) {
+                if (x0 + x < width) put_pixel(x0 + x, abs_y, bg);
+            }
+        }
+    }
+
+    for (uint64_t y = 0; y < 8; ++y) {
+        int64_t abs_y = (int64_t)y0 + (int64_t)y;
+        // only draw if the pixel falls within the cell's vertical bounds
+        if (abs_y >= (int64_t)cell_y && abs_y < (int64_t)(cell_y + 12)) {
+            uint8_t row = g.rows[y];
+            for (uint64_t x = 0; x < 8; ++x)
+                if (row & (0x80u >> x))
+                    put_pixel(x0+x, (uint64_t)abs_y, color);
+        }
     }
 }
 
@@ -94,30 +180,28 @@ inline void* fb_memmove(void* dst, const void* src, uint64_t n) {
 inline void scroll() {
     const uint64_t line_px = 12;
     const uint64_t bytes_per_line = pitch;
-
     uint8_t* base = (uint8_t*)pixels;
 
-    const uint64_t move_bytes =
-        (height - line_px) * bytes_per_line;
+    erase_mice();
 
-    // move framebuffer memory upward
-    fb_memmove(
-        base,
-        base + line_px * bytes_per_line,
-        move_bytes
-    );
+    for (uint64_t i = 0; i < line_px; ++i) {
+        // move everything up by 1 pixel
+        fb_memmove(
+            base,
+            base + bytes_per_line,
+            (height - 1) * bytes_per_line
+        );
 
-    // clear bottom region
-    uint8_t* bottom =
-        base + (height - line_px) * bytes_per_line;
-
-    for (uint64_t y = 0; y < line_px; ++y) {
-        uint32_t* row =
-            (uint32_t*)(bottom + y * bytes_per_line);
-
+        // clear the very bottom pixel row
+        uint32_t* last_row = (uint32_t*)(base + (height - 1) * bytes_per_line);
         for (uint64_t x = 0; x < width; ++x)
-            row[x] = BG;
+            last_row[x] = BG;
+
+        // delay for smoothness - we'll hardcode 4ms if not provided by config to avoid cycle
+        pit::sleep_ms(2); 
     }
+
+    draw_mice();
 }
 
 inline void newline() {
@@ -130,6 +214,7 @@ inline void newline() {
 }
 
 inline void print(const char* str, uint32_t color = FG) {
+    erase_mice();
     while (*str) {
         if (*str == '\n') {
             newline();
@@ -141,6 +226,7 @@ inline void print(const char* str, uint32_t color = FG) {
         }
         ++str;
     }
+    draw_mice();
 }
 
 inline void erase_cell(uint64_t x, uint64_t y) {
@@ -159,6 +245,20 @@ inline void backspace() {
         return;
     }
     erase_cell(cur_x, cur_y);
+}
+
+inline void draw_rect(uint64_t x0, uint64_t y0, uint64_t w, uint64_t h, uint32_t color) {
+    if (x0 >= width || y0 >= height) return;
+    if (x0 + w > width)  w = width - x0;
+    if (y0 + h > height) h = height - y0;
+
+    erase_mice();
+    for (uint64_t y = 0; y < h; ++y) {
+        uint32_t* row = (uint32_t*)((uint8_t*)pixels + (y0 + y) * pitch);
+        for (uint64_t x = 0; x < w; ++x)
+            if (x0 + x < width) row[x0 + x] = color;
+    }
+    draw_mice();
 }
 
 } // namespace fb

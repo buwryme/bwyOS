@@ -61,6 +61,31 @@ struct keyboard_t : driver_t {
         return true;
     }
 
+    char poll_key() {
+        auto st = read8(PORT_STATUS);
+        if (st.fail() || !(st.value & 0x01)) return '\0';
+
+        // if bit 5 is set, it's mouse data, don't consume it here
+        if (st.value & 0x20) return '\0';
+
+        auto sc_r = read8(PORT_DATA);
+        if (sc_r.fail()) return '\0';
+        uint8_t sc = sc_r.value;
+
+        if (sc == 0x2a || sc == 0x36) { shift = true;  return '\0'; }
+        if (sc == 0xaa || sc == 0xb6) { shift = false; return '\0'; }
+        if (sc == 0x3a) { caps = !caps; return '\0'; }
+        if (sc & 0x80) return '\0';
+        if (sc >= 128)  return '\0';
+
+        char base = keymap[sc];
+        if (!base) return '\0';
+
+        bool upper = shift;
+        if (caps && base >= 'a' && base <= 'z') upper = !upper;
+        return upper ? shifted[sc] : base;
+    }
+
     // get_key: blocking read — waits for a keypress, returns the ascii char.
     // handles port errors gracefully: on bad_port returns '\0' immediately;
     // on other transient errors retries (pause + continue).
@@ -73,6 +98,12 @@ struct keyboard_t : driver_t {
                 asm volatile("pause"); continue;
             }
             if (!(st.value & 0x01)) { asm volatile("pause"); continue; }
+
+            // skip mouse data
+            if (st.value & 0x20) {
+                read8(PORT_DATA); // consume but ignore
+                asm volatile("pause"); continue;
+            }
 
             // read scancode
             auto sc_r = read8(PORT_DATA);
