@@ -1,0 +1,137 @@
+#pragma once
+
+#include <stdint.h>
+
+namespace cpuid {
+
+struct regs_t {
+    uint32_t eax, ebx, ecx, edx;
+};
+
+static inline regs_t query(uint32_t leaf, uint32_t subleaf = 0) {
+    regs_t r;
+    asm volatile(
+        "cpuid"
+        : "=a"(r.eax), "=b"(r.ebx), "=c"(r.ecx), "=d"(r.edx)
+        : "a"(leaf), "c"(subleaf)
+    );
+    return r;
+}
+
+// write a 4-byte chunk of a cpuid string register into buf at offset
+static inline void unpack(char* buf, uint32_t reg) {
+    buf[0] = (char)( reg        & 0xff);
+    buf[1] = (char)((reg >>  8) & 0xff);
+    buf[2] = (char)((reg >> 16) & 0xff);
+    buf[3] = (char)((reg >> 24) & 0xff);
+}
+
+// vendor string — "GenuineIntel", "AuthenticAMD", etc. (12 chars + nul)
+static inline void vendor(char out[13]) {
+    auto r = query(0x0);
+    unpack(out + 0, r.ebx);
+    unpack(out + 4, r.edx);
+    unpack(out + 8, r.ecx);
+    out[12] = '\0';
+}
+
+// brand string — up to 48 chars + nul, from leaves 0x80000002–4
+static inline void brand(char out[49]) {
+    for (int i = 0; i < 3; ++i) {
+        auto r = query(0x80000002 + (uint32_t)i);
+        unpack(out + i*16 +  0, r.eax);
+        unpack(out + i*16 +  4, r.ebx);
+        unpack(out + i*16 +  8, r.ecx);
+        unpack(out + i*16 + 12, r.edx);
+    }
+    out[48] = '\0';
+}
+
+// max basic leaf (highest leaf supported by this cpu)
+static inline uint32_t max_leaf() { return query(0x0).eax; }
+
+// max extended leaf
+static inline uint32_t max_ext_leaf() { return query(0x80000000).eax; }
+
+// stepping, model, family packed from eax of leaf 1
+struct version_t {
+    uint8_t stepping;
+    uint8_t model;
+    uint8_t family;
+    uint8_t type;
+};
+
+static inline version_t version() {
+    uint32_t eax = query(0x1).eax;
+    version_t v;
+    v.stepping = eax & 0xf;
+    v.model    = (eax >> 4)  & 0xf;
+    v.family   = (eax >> 8)  & 0xf;
+    v.type     = (eax >> 12) & 0x3;
+
+    // extended model / family
+    if (v.family == 0x6 || v.family == 0xf)
+        v.model |= (uint8_t)(((eax >> 16) & 0xf) << 4);
+    if (v.family == 0xf)
+        v.family = (uint8_t)(v.family + ((eax >> 20) & 0xff));
+    return v;
+}
+
+// feature flags from leaf 1
+struct features_t {
+    // ecx
+    bool sse3, pclmul, dtes64, monitor, ds_cpl, vmx, smx, est;
+    bool tm2, ssse3, cid, fma, cx16, etprd, pdcm, pcide, dca;
+    bool sse4_1, sse4_2, x2apic, movbe, popcnt, tsc_dl, aes;
+    bool xsave, osxsave, avx, f16c, rdrnd;
+    // edx
+    bool fpu, vme, de, pse, tsc, msr, pae, mce;
+    bool cx8, apic, sep, mtrr, pge, mca, cmov, pat;
+    bool pse36, psn, clfsh, ds, acpi_feat, mmx, fxsr;
+    bool sse, sse2, ss, htt, tm, ia64, pbe;
+};
+
+static inline features_t features() {
+    auto r = query(0x1);
+    features_t f = {};
+    uint32_t c = r.ecx, d = r.edx;
+    f.sse3    = (c >>  0) & 1; f.pclmul  = (c >>  1) & 1;
+    f.dtes64  = (c >>  2) & 1; f.monitor = (c >>  3) & 1;
+    f.ds_cpl  = (c >>  4) & 1; f.vmx     = (c >>  5) & 1;
+    f.smx     = (c >>  6) & 1; f.est     = (c >>  7) & 1;
+    f.tm2     = (c >>  8) & 1; f.ssse3   = (c >>  9) & 1;
+    f.cid     = (c >> 10) & 1; f.fma     = (c >> 12) & 1;
+    f.cx16    = (c >> 13) & 1; f.etprd   = (c >> 14) & 1;
+    f.pdcm    = (c >> 16) & 1; f.pcide   = (c >> 17) & 1;
+    f.dca     = (c >> 18) & 1; f.sse4_1  = (c >> 19) & 1;
+    f.sse4_2  = (c >> 20) & 1; f.x2apic  = (c >> 21) & 1;
+    f.movbe   = (c >> 22) & 1; f.popcnt  = (c >> 23) & 1;
+    f.tsc_dl  = (c >> 24) & 1; f.aes     = (c >> 25) & 1;
+    f.xsave   = (c >> 26) & 1; f.osxsave = (c >> 27) & 1;
+    f.avx     = (c >> 28) & 1; f.f16c    = (c >> 29) & 1;
+    f.rdrnd   = (c >> 30) & 1;
+
+    f.fpu   = (d >>  0) & 1; f.vme   = (d >>  1) & 1;
+    f.de    = (d >>  2) & 1; f.pse   = (d >>  3) & 1;
+    f.tsc   = (d >>  4) & 1; f.msr   = (d >>  5) & 1;
+    f.pae   = (d >>  6) & 1; f.mce   = (d >>  7) & 1;
+    f.cx8   = (d >>  8) & 1; f.apic  = (d >>  9) & 1;
+    f.sep   = (d >> 11) & 1; f.mtrr  = (d >> 12) & 1;
+    f.pge   = (d >> 13) & 1; f.mca   = (d >> 14) & 1;
+    f.cmov  = (d >> 15) & 1; f.pat   = (d >> 16) & 1;
+    f.pse36 = (d >> 17) & 1; f.psn   = (d >> 18) & 1;
+    f.clfsh = (d >> 19) & 1; f.ds    = (d >> 21) & 1;
+    f.acpi_feat=(d>>22)&1;   f.mmx   = (d >> 23) & 1;
+    f.fxsr  = (d >> 24) & 1; f.sse   = (d >> 25) & 1;
+    f.sse2  = (d >> 26) & 1; f.ss    = (d >> 27) & 1;
+    f.htt   = (d >> 28) & 1; f.tm    = (d >> 29) & 1;
+    f.ia64  = (d >> 30) & 1; f.pbe   = (d >> 31) & 1;
+    return f;
+}
+
+// logical cpu count from leaf 1 edx[23:16]
+static inline uint8_t logical_cores() {
+    return (uint8_t)((query(0x1).ebx >> 16) & 0xff);
+}
+
+} // namespace cpuid

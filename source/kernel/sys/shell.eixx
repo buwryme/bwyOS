@@ -9,6 +9,7 @@
 #include "../sys/panic.eixx"
 #include "../mm/cascade.eixx"
 #include "../fs/vfs.eixx"
+#include "../cpu/cpuid.eixx"
 
 namespace shell {
 
@@ -431,6 +432,72 @@ static void cmd_fault(const char* arg) {
     }
 }
 
+static void cmd_cpuid() {
+    // vendor
+    char vendor[13];
+    cpuid::vendor(vendor);
+    fb::print("vendor  : ", fb::GRAY);
+    fb::print(vendor, fb::FG);
+    fb::print("\n", fb::FG);
+
+    // brand string (leaf 0x80000002–4)
+    char brand[49];
+    cpuid::brand(brand);
+    // trim leading spaces (brand strings often start with spaces)
+    const char* b = brand;
+    while (*b == ' ') ++b;
+    fb::print("brand   : ", fb::GRAY);
+    fb::print(b, fb::FG);
+    fb::print("\n", fb::FG);
+
+    // version
+    auto ver = cpuid::version();
+    fb::print("family  : ", fb::GRAY); kprint::u64(ver.family,   fb::FG); fb::print("\n", fb::FG);
+    fb::print("model   : ", fb::GRAY); kprint::u64(ver.model,    fb::FG); fb::print("\n", fb::FG);
+    fb::print("stepping: ", fb::GRAY); kprint::u64(ver.stepping, fb::FG); fb::print("\n", fb::FG);
+
+    // logical core count
+    fb::print("cores   : ", fb::GRAY); kprint::u64(cpuid::logical_cores(), fb::FG); fb::print("\n", fb::FG);
+
+    // max leaves
+    fb::print("max leaf: ", fb::GRAY); kprint::hex(cpuid::max_leaf(),     8, fb::PURPLE); fb::print("\n", fb::FG);
+    fb::print("max ext : ", fb::GRAY); kprint::hex(cpuid::max_ext_leaf(), 8, fb::PURPLE); fb::print("\n", fb::FG);
+
+    // feature flags — only print the ones present
+    auto feat = cpuid::features();
+    fb::print("features: ", fb::GRAY);
+
+    struct { bool on; const char* name; } flags[] = {
+        {feat.fpu,    "fpu"},    {feat.vme,    "vme"},
+        {feat.de,     "de"},     {feat.pse,    "pse"},
+        {feat.tsc,    "tsc"},    {feat.msr,    "msr"},
+        {feat.pae,    "pae"},    {feat.mce,    "mce"},
+        {feat.cx8,    "cx8"},    {feat.apic,   "apic"},
+        {feat.sep,    "sep"},    {feat.mtrr,   "mtrr"},
+        {feat.pge,    "pge"},    {feat.cmov,   "cmov"},
+        {feat.mmx,    "mmx"},    {feat.fxsr,   "fxsr"},
+        {feat.sse,    "sse"},    {feat.sse2,   "sse2"},
+        {feat.htt,    "htt"},    {feat.sse3,   "sse3"},
+        {feat.ssse3,  "ssse3"},  {feat.sse4_1, "sse4.1"},
+        {feat.sse4_2, "sse4.2"}, {feat.aes,    "aes"},
+        {feat.avx,    "avx"},    {feat.f16c,   "f16c"},
+        {feat.fma,    "fma"},    {feat.rdrnd,  "rdrnd"},
+        {feat.vmx,    "vmx"},    {feat.cx16,   "cx16"},
+        {feat.popcnt, "popcnt"}, {feat.xsave,  "xsave"},
+        {feat.movbe,  "movbe"},  {feat.x2apic, "x2apic"},
+    };
+
+    bool any = false;
+    for (auto& f : flags) {
+        if (!f.on) continue;
+        if (any) fb::print(" ", fb::FG);
+        fb::print(f.name, fb::GREEN);
+        any = true;
+    }
+    if (!any) fb::print("none", fb::GRAY);
+    fb::print("\n", fb::FG);
+}
+
 // ── secret ────────────────────────────────────────────────────────────────
 [[noreturn]] static void cmd_67() {
     static char msg[] = "67 diddy epstein — 67 67 67 67 67";
@@ -512,6 +579,7 @@ inline void run() {
         else if ((arg = const_cast<char*>(match(buf, "panic")))   != nullptr) cmd_panic(arg);
         else if (streq(buf, "panic"))         cmd_panic(nullptr);
         else if ((arg = const_cast<char*>(match(buf, "fault")))   != nullptr) cmd_fault(arg);
+        else if ((arg = const_cast<char*>(match(buf, "cpuid")))   != nullptr) cmd_cpuid();
         else {
             fb::print("bwy.sh: not found: ", fb::RED);
             fb::print(buf, fb::RED); fb::print("\n");
